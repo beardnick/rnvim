@@ -36,8 +36,13 @@ use crate::remotes;
 use crate::session::Router;
 use crate::target::Target;
 
+/// Version-stamped socket name: a client always talks to a daemon of its
+/// own version — after an upgrade the new client simply starts a fresh
+/// daemon instead of speaking a stale protocol to an old one.
 pub fn control_socket_path() -> Result<std::path::PathBuf> {
-    Ok(nvim::rnvim_home()?.join("run").join("daemon.sock"))
+    Ok(nvim::rnvim_home()?
+        .join("run")
+        .join(format!("daemon-{}.sock", env!("CARGO_PKG_VERSION"))))
 }
 
 struct Session {
@@ -168,6 +173,9 @@ impl Daemon {
         self.focus(id);
     }
 
+    /// Apply a new client size everywhere. Diff baselines are invalidated:
+    /// contents_diff across two different grid sizes produces garbage
+    /// positioning, so the next paint after any resize must be a full frame.
     fn resize_all(&self, size: PtySize) {
         *self.size.lock().unwrap() = size;
         for session in self.sessions.lock().unwrap().iter() {
@@ -177,6 +185,7 @@ impl Daemon {
                 .lock()
                 .unwrap()
                 .set_size(size.rows, size.cols);
+            *session.last_sent.lock().unwrap() = None;
         }
     }
 
@@ -340,6 +349,12 @@ impl Daemon {
                     pixel_width: 0,
                     pixel_height: 0,
                 });
+                // Full frame right away — the real terminal may hold stale
+                // content outside the new grid, and nvim's own SIGWINCH
+                // redraw may lag (or never come while it's idle).
+                if let Some(session) = self.active_session() {
+                    self.repaint(&session);
+                }
             }
             "focus" => {
                 if let Some(id) = msg.get("id").and_then(Value::as_u64) {

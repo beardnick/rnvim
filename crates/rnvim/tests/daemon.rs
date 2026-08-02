@@ -53,7 +53,10 @@ fn start_daemon() -> DaemonUnderTest {
 }
 
 fn connect(home: &Path) -> UnixStream {
-    let sock = home.join(".rnvim/run/daemon.sock");
+    let sock = home.join(format!(
+        ".rnvim/run/daemon-{}.sock",
+        env!("CARGO_PKG_VERSION")
+    ));
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         if let Ok(s) = UnixStream::connect(&sock) {
@@ -190,6 +193,22 @@ fn attach_edit_detach_reattach() {
         "same session after reattach"
     );
     reader.wait_for("post-reattach output", |m| is_type(m, "output"));
+
+    // --- resize invalidates diff baselines: the next paint must be a full
+    // frame (2J-prefixed), never a cross-size diff
+    send(
+        &mut stream,
+        &json!({ "t": "resize", "cols": 120, "rows": 40 }),
+    );
+    reader.wait_for("full frame after resize", |m| {
+        use base64::Engine;
+        is_type(m, "output")
+            && m["b64"]
+                .as_str()
+                .and_then(|b| base64::engine::general_purpose::STANDARD.decode(b).ok())
+                .map(|bytes| bytes.starts_with(b"\x1b[2J"))
+                .unwrap_or(false)
+    });
 
     // --- second session via the connect path the picker uses
     send(
