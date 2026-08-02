@@ -196,6 +196,20 @@ pub fn run(target: Option<&str>) -> Result<i32> {
                     print!("\x1b[2J\x1b[H");
                     let _ = stdout.flush();
                     mode = Mode::Passthrough;
+                    // Belt and braces: make sure the daemon has our real
+                    // size for the session we just landed on.
+                    let size = term_size();
+                    last_size = size;
+                    send(
+                        &mut stream,
+                        &json!({ "t": "resize", "cols": size.0, "rows": size.1 }),
+                    )?;
+                }
+                "status" => {
+                    if let Some(text) = msg.get("msg").and_then(Value::as_str) {
+                        print!("\r\x1b[2K\x1b[90m[rnvim] {text}\x1b[0m");
+                        let _ = stdout.flush();
+                    }
                 }
                 "sessions" => {
                     if let Mode::Manager { items, selected } = &mut mode {

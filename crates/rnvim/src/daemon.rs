@@ -61,6 +61,8 @@ struct Session {
     parser: Mutex<vt100::Parser>,
     /// The frame as last painted, to skip sends when nothing changed.
     last_frame: Mutex<Option<Vec<u8>>>,
+    /// (rows, cols) last applied to the PTY + parser, for apply_size.
+    applied_size: Mutex<(u16, u16)>,
 }
 
 /// Full-screen frame: clear, redraw everything, restore cursor — applied
@@ -148,12 +150,35 @@ impl Daemon {
         json!({ "t": "sessions", "items": items })
     }
 
+    fn status(&self, msg: &str) {
+        eprintln!("[rnvim] {msg}");
+        self.send_client(&json!({ "t": "status", "msg": msg }));
+    }
+
     /// Paint the session's full screen to the client from the daemon's own
     /// virtual-screen state. Purely local — needs nothing from nvim.
     fn repaint(&self, session: &Session) {
         let frame = full_frame(session.parser.lock().unwrap().screen());
         *session.last_frame.lock().unwrap() = Some(frame.clone());
         self.send_client(&json!({ "t": "output", "b64": B64.encode(&frame) }));
+    }
+
+    /// Guarantee this session's PTY and virtual screen match the client
+    /// size, whatever path it took to get here (belt and braces: a session
+    /// stuck at a stale size renders as a fraction of the terminal).
+    fn apply_size(&self, session: &Session) {
+        let size = *self.size.lock().unwrap();
+        let mut applied = session.applied_size.lock().unwrap();
+        if *applied != (size.rows, size.cols) {
+            let _ = session.master.lock().unwrap().resize(size);
+            session
+                .parser
+                .lock()
+                .unwrap()
+                .set_size(size.rows, size.cols);
+            *session.last_frame.lock().unwrap() = None;
+            *applied = (size.rows, size.cols);
+        }
     }
 
     fn focus(&self, id: u64) {
@@ -166,6 +191,7 @@ impl Daemon {
             "id": id,
             "title": session.title.lock().unwrap().clone(),
         }));
+        self.apply_size(&session);
         self.repaint(&session);
     }
 
@@ -195,6 +221,7 @@ impl Daemon {
                 .unwrap()
                 .set_size(size.rows, size.cols);
             *session.last_frame.lock().unwrap() = None;
+            *session.applied_size.lock().unwrap() = (size.rows, size.cols);
         }
     }
 
@@ -232,6 +259,13 @@ impl Daemon {
             listen: None,
             headless_cmds: vec![],
         };
+
+        if let Some(t) = target {
+            self.status(&format!("connecting to {t}..."));
+        }
+        if !nvim::nvim_installed() {
+            self.status("downloading Neovim (first run, ~10MB)...");
+        }
 
         let title = match target {
             Some(t) => {
@@ -285,6 +319,7 @@ impl Daemon {
             killer: Mutex::new(killer),
             parser: Mutex::new(vt100::Parser::new(size.rows, size.cols, 0)),
             last_frame: Mutex::new(None),
+            applied_size: Mutex::new((size.rows, size.cols)),
         });
         self.sessions.lock().unwrap().push(Arc::clone(&session));
 

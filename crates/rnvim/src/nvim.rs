@@ -25,6 +25,24 @@ fn asset_name() -> Result<&'static str> {
     })
 }
 
+/// True if the managed nvim (or an override) is already present — used to
+/// warn clients that a first-run download is about to happen.
+pub fn nvim_installed() -> bool {
+    if std::env::var_os("RNVIM_NVIM_BIN").is_some() {
+        return true;
+    }
+    match (asset_name(), rnvim_home()) {
+        (Ok(asset), Ok(home)) => home
+            .join("versions")
+            .join(NVIM_VERSION)
+            .join(asset)
+            .join("bin")
+            .join("nvim")
+            .exists(),
+        _ => false,
+    }
+}
+
 /// Return the managed nvim binary, downloading it on first use.
 /// RNVIM_NVIM_BIN overrides (escape hatch / CI).
 pub fn ensure_nvim() -> Result<PathBuf> {
