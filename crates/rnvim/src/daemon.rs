@@ -52,13 +52,24 @@ struct Session {
     writer: Mutex<Box<dyn Write + Send>>,
     killer: Mutex<Box<dyn ChildKiller + Send>>,
     /// The session's virtual screen: every PTY byte goes through this
-    /// terminal emulator, and clients are painted purely from its state
-    /// (full frame on switch/attach, minimal diffs while streaming). This
-    /// is what makes detach/switch rendering deterministic — no reliance
-    /// on nvim redrawing, no escape sequences cut mid-stream.
+    /// terminal emulator, and clients are painted purely from its state.
+    /// Always full frames — vt100's contents_diff has known correctness
+    /// holes (Google's shpool forked the crate over them; we saw floats
+    /// leave stale rectangles), so no incremental path exists to get
+    /// wrong. Frames are wrapped in synchronized-output (CSI ?2026) so
+    /// supporting terminals apply them atomically, flicker-free.
     parser: Mutex<vt100::Parser>,
-    /// Screen state as last painted to the client, if any.
-    last_sent: Mutex<Option<vt100::Screen>>,
+    /// The frame as last painted, to skip sends when nothing changed.
+    last_frame: Mutex<Option<Vec<u8>>>,
+}
+
+/// Full-screen frame: clear, redraw everything, restore cursor — applied
+/// atomically by terminals that support synchronized output.
+fn full_frame(screen: &vt100::Screen) -> Vec<u8> {
+    let mut bytes = b"\x1b[?2026h\x1b[2J\x1b[H".to_vec();
+    bytes.extend_from_slice(&screen.contents_formatted());
+    bytes.extend_from_slice(b"\x1b[?2026l");
+    bytes
 }
 
 struct Daemon {
@@ -140,11 +151,9 @@ impl Daemon {
     /// Paint the session's full screen to the client from the daemon's own
     /// virtual-screen state. Purely local — needs nothing from nvim.
     fn repaint(&self, session: &Session) {
-        let screen = session.parser.lock().unwrap().screen().clone();
-        let mut bytes = b"\x1b[2J\x1b[H".to_vec();
-        bytes.extend_from_slice(&screen.contents_formatted());
-        *session.last_sent.lock().unwrap() = Some(screen);
-        self.send_client(&json!({ "t": "output", "b64": B64.encode(&bytes) }));
+        let frame = full_frame(session.parser.lock().unwrap().screen());
+        *session.last_frame.lock().unwrap() = Some(frame.clone());
+        self.send_client(&json!({ "t": "output", "b64": B64.encode(&frame) }));
     }
 
     fn focus(&self, id: u64) {
@@ -185,7 +194,7 @@ impl Daemon {
                 .lock()
                 .unwrap()
                 .set_size(size.rows, size.cols);
-            *session.last_sent.lock().unwrap() = None;
+            *session.last_frame.lock().unwrap() = None;
         }
     }
 
@@ -275,7 +284,7 @@ impl Daemon {
             writer: Mutex::new(writer),
             killer: Mutex::new(killer),
             parser: Mutex::new(vt100::Parser::new(size.rows, size.cols, 0)),
-            last_sent: Mutex::new(None),
+            last_frame: Mutex::new(None),
         });
         self.sessions.lock().unwrap().push(Arc::clone(&session));
 
@@ -291,31 +300,24 @@ impl Daemon {
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
-                        let screen = {
+                        let frame = {
                             let mut parser = sess.parser.lock().unwrap();
                             parser.process(&buf[..n]);
-                            parser.screen().clone()
+                            full_frame(parser.screen())
                         };
                         if daemon.active.load(Ordering::SeqCst) != id {
                             continue;
                         }
-                        let mut last = sess.last_sent.lock().unwrap();
-                        let bytes = match last.as_ref() {
-                            Some(prev) => screen.contents_diff(prev),
-                            None => {
-                                let mut b = b"\x1b[2J\x1b[H".to_vec();
-                                b.extend_from_slice(&screen.contents_formatted());
-                                b
-                            }
-                        };
-                        *last = Some(screen);
-                        drop(last);
-                        if !bytes.is_empty() {
-                            daemon.send_client(&json!({
-                                "t": "output",
-                                "b64": B64.encode(&bytes),
-                            }));
+                        let mut last = sess.last_frame.lock().unwrap();
+                        if last.as_deref() == Some(frame.as_slice()) {
+                            continue;
                         }
+                        *last = Some(frame.clone());
+                        drop(last);
+                        daemon.send_client(&json!({
+                            "t": "output",
+                            "b64": B64.encode(&frame),
+                        }));
                     }
                 }
             }
