@@ -156,25 +156,53 @@ pub fn run(target: Option<&str>) -> Result<i32> {
     let mut last_size_check = Instant::now();
     let mut stdin = std::io::stdin();
 
-    // Non-blocking stdin as well; poll both with a small sleep.
-    unsafe {
-        let flags = libc::fcntl(0, libc::F_GETFL);
-        libc::fcntl(0, libc::F_SETFL, flags | libc::O_NONBLOCK);
-    }
+    // Readiness via poll(2), NOT O_NONBLOCK on stdin: on a tty, stdin and
+    // stdout share one open file description, so a non-blocking stdin
+    // silently makes stdout non-blocking too — and large frames then get
+    // truncated mid-write (frozen, half-painted screens). stdout must stay
+    // blocking so write_all always lands complete frames.
+    use std::os::fd::AsRawFd;
+    let sock_fd = stream.as_raw_fd();
 
     loop {
-        let mut progressed = false;
+        let (stdin_ready, sock_ready) = {
+            let mut fds = [
+                libc::pollfd {
+                    fd: 0,
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: sock_fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
+            let r = unsafe { libc::poll(fds.as_mut_ptr(), 2, 50) };
+            if r < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == ErrorKind::Interrupted {
+                    (false, false)
+                } else {
+                    return Err(err.into());
+                }
+            } else {
+                (
+                    fds[0].revents & libc::POLLIN != 0,
+                    fds[1].revents & (libc::POLLIN | libc::POLLHUP) != 0,
+                )
+            }
+        };
 
         // socket → screen / state
-        let mut chunk = [0u8; 16 * 1024];
-        match stream.read(&mut chunk) {
-            Ok(0) => bail!("daemon closed the connection"),
-            Ok(n) => {
-                sock_buf.extend_from_slice(&chunk[..n]);
-                progressed = true;
+        if sock_ready {
+            let mut chunk = [0u8; 64 * 1024];
+            match stream.read(&mut chunk) {
+                Ok(0) => bail!("daemon closed the connection"),
+                Ok(n) => sock_buf.extend_from_slice(&chunk[..n]),
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {}
+                Err(e) => return Err(e.into()),
             }
-            Err(e) if e.kind() == ErrorKind::WouldBlock => {}
-            Err(e) => return Err(e.into()),
         }
         while let Some(pos) = sock_buf.iter().position(|&b| b == b'\n') {
             let line: Vec<u8> = sock_buf.drain(..=pos).collect();
@@ -230,19 +258,21 @@ pub fn run(target: Option<&str>) -> Result<i32> {
             }
         }
 
-        // keyboard → daemon / mode machine
-        let mut keys = [0u8; 1024];
-        match stdin.read(&mut keys) {
-            Ok(0) => {}
-            Ok(n) => {
-                progressed = true;
-                handle_keys(&keys[..n], &mut mode, &mut stream)?;
-                if matches!(mode, Mode::Detached) {
-                    return Ok(0);
+        // keyboard → daemon / mode machine (stdin is blocking, but poll
+        // said data is ready, so this read returns immediately)
+        if stdin_ready {
+            let mut keys = [0u8; 1024];
+            match stdin.read(&mut keys) {
+                Ok(0) => {}
+                Ok(n) => {
+                    handle_keys(&keys[..n], &mut mode, &mut stream)?;
+                    if matches!(mode, Mode::Detached) {
+                        return Ok(0);
+                    }
                 }
+                Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                Err(e) => return Err(e.into()),
             }
-            Err(e) if e.kind() == ErrorKind::WouldBlock => {}
-            Err(e) => return Err(e.into()),
         }
 
         // terminal resize (polled — no signal handler needed)
@@ -256,10 +286,6 @@ pub fn run(target: Option<&str>) -> Result<i32> {
                     &json!({ "t": "resize", "cols": size.0, "rows": size.1 }),
                 )?;
             }
-        }
-
-        if !progressed {
-            std::thread::sleep(Duration::from_millis(8));
         }
     }
 }
