@@ -59,8 +59,9 @@ struct Session {
     /// wrong. Frames are wrapped in synchronized-output (CSI ?2026) so
     /// supporting terminals apply them atomically, flicker-free.
     parser: Mutex<vt100::Parser>,
-    /// The frame as last painted, to skip sends when nothing changed.
-    last_frame: Mutex<Option<Vec<u8>>>,
+    /// What the client's screen currently shows (our own per-row
+    /// serializations), for row-level diffing. None = full repaint next.
+    render_state: Mutex<Option<RenderState>>,
     /// (rows, cols) last applied to the PTY + parser, for apply_size.
     applied_size: Mutex<(u16, u16)>,
 }
@@ -106,6 +107,62 @@ fn full_frame(screen: &vt100::Screen) -> Vec<u8> {
 /// session switch) is handled by the CLIENT clearing on "switched".
 const FRAME_PREFIX: &[u8] = b"\x1b[?2026h\x1b[?25l";
 
+/// Per-row serialization of the last frame sent, plus the geometry it was
+/// rendered for. Rows are content-only (no cursor positioning), each
+/// starting from a fresh SGR state, so they compare and repaint
+/// independently — a byte-equal row is guaranteed identical on screen.
+struct RenderState {
+    grid: Vec<Vec<u8>>,
+    sidebar: Vec<Vec<u8>>,
+    offset: u16,
+    rows: u16,
+    cols: u16,
+    cursor: (u16, u16, bool),
+}
+
+/// Rows still dirty if the terminal scrolls the old screen by `k` first
+/// (k > 0 moves content up, matching `new[i] == old[i+k]`).
+fn dirty_after_shift(old: &[Vec<u8>], new: &[Vec<u8>], k: i32) -> Vec<usize> {
+    (0..new.len())
+        .filter(|&i| {
+            let j = i as i64 + k as i64;
+            !(j >= 0 && (j as usize) < old.len() && new[i] == old[j as usize])
+        })
+        .collect()
+}
+
+/// Pick the vertical shift that leaves the fewest rows to repaint. An nvim
+/// screen never shifts wholesale — the statusline, ruler and other chrome
+/// stay put while text scrolls — so this asks "which scroll saves the most
+/// rows", repaints the rest explicitly, and only bothers when the saving
+/// is substantial. Returns k > 0 for ESC[kS (up), k < 0 for ESC[kT (down).
+fn detect_scroll(old: &[Vec<u8>], new: &[Vec<u8>]) -> Option<i32> {
+    let n = old.len();
+    if n < 8 || new.len() != n {
+        return None;
+    }
+    let base = dirty_after_shift(old, new, 0).len();
+    if base <= n / 3 {
+        return None; // small diffs are cheaper than scroll + chrome repaint
+    }
+    let max_k = (n as i32 - 1).min(48);
+    let mut best = (0i32, base);
+    for k in 1..=max_k {
+        for kk in [k, -k] {
+            let d = dirty_after_shift(old, new, kk).len();
+            if d < best.1 {
+                best = (kk, d);
+            }
+        }
+    }
+    // require a solid win: the scroll must save at least a third of the rows
+    if best.0 != 0 && best.1 + n / 3 <= base {
+        Some(best.0)
+    } else {
+        None
+    }
+}
+
 fn finish_frame(out: &mut Vec<u8>, screen: &vt100::Screen, col_offset: u16) {
     let (cursor_row, cursor_col) = screen.cursor_position();
     out.extend_from_slice(
@@ -126,11 +183,21 @@ fn finish_frame(out: &mut Vec<u8>, screen: &vt100::Screen, col_offset: u16) {
 
 /// Paint the whole grid, every cell explicit, shifted right by col_offset.
 fn render_grid(out: &mut Vec<u8>, screen: &vt100::Screen, col_offset: u16) {
+    for (row, bytes) in grid_rows(screen).iter().enumerate() {
+        out.extend_from_slice(format!("\x1b[{};{}H", row + 1, col_offset + 1).as_bytes());
+        out.extend_from_slice(bytes);
+    }
+}
+
+/// Content-only serialization of every grid row. Each row starts from a
+/// fresh SGR state so rows are independent, comparable units.
+fn grid_rows(screen: &vt100::Screen) -> Vec<Vec<u8>> {
     let (rows, cols) = screen.size();
-    let mut current_sgr = String::new();
+    let mut result = Vec::with_capacity(rows as usize);
 
     for row in 0..rows {
-        out.extend_from_slice(format!("\x1b[{};{}H", row + 1, col_offset + 1).as_bytes());
+        let mut out: Vec<u8> = Vec::with_capacity(cols as usize * 2);
+        let mut current_sgr = String::new();
         let mut col = 0;
         while col < cols {
             let Some(cell) = screen.cell(row, col) else {
@@ -164,16 +231,28 @@ fn render_grid(out: &mut Vec<u8>, screen: &vt100::Screen, col_offset: u16) {
             // A wide glyph occupies the next cell too; don't overwrite it.
             col += if cell.is_wide() { 2 } else { 1 };
         }
+        result.push(out);
     }
+    result
 }
 
 /// Paint the session sidebar into columns 1..=SIDEBAR_WIDTH: header, one
 /// row per session (active inverted), separator column, every cell
 /// explicit per the weakest-terminal rule.
+#[cfg_attr(not(test), allow(dead_code))] // kept for the rendering tests
 fn render_sidebar(out: &mut Vec<u8>, items: &[(String, bool)], rows: u16) {
+    for (i, bytes) in sidebar_rows(items, rows).iter().enumerate() {
+        out.extend_from_slice(format!("\x1b[{};1H", i + 1).as_bytes());
+        out.extend_from_slice(bytes);
+    }
+}
+
+/// Content-only serialization of every sidebar row (self-contained SGR).
+fn sidebar_rows(items: &[(String, bool)], rows: u16) -> Vec<Vec<u8>> {
     let text_w = (SIDEBAR_WIDTH - 1) as usize;
+    let mut result = Vec::with_capacity(rows as usize);
     for row in 1..=rows {
-        out.extend_from_slice(format!("\x1b[{row};1H").as_bytes());
+        let mut out: Vec<u8> = Vec::with_capacity(text_w + 24);
         let (label, active) = match row {
             1 => (" SESSIONS".to_string(), false),
             r if (r as usize) >= 2 && (r as usize) - 2 < items.len() => {
@@ -208,11 +287,11 @@ fn render_sidebar(out: &mut Vec<u8>, items: &[(String, bool)], rows: u16) {
             out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
             printed += 1;
         }
-        for _ in printed..text_w {
-            out.push(b' ');
-        }
+        out.extend(std::iter::repeat_n(b' ', text_w.saturating_sub(printed)));
         out.extend_from_slice("\x1b[0;38;5;240m\u{2502}".as_bytes());
+        result.push(out);
     }
+    result
 }
 
 /// Rewrite SGR mouse coordinates for the sidebar offset. Returns the bytes
@@ -267,13 +346,15 @@ fn translate_sgr_mouse(data: &[u8], sidebar_w: u16) -> (Vec<u8>, Vec<u32>) {
 }
 
 /// Channel to the attached client. Control messages queue (they are tiny
-/// and every one matters); output frames coalesce in a latest-wins slot —
-/// each frame is a complete screen, so a slow terminal skips straight to
-/// the newest state instead of replaying a growing backlog (which froze
-/// slow embedded terminals for minutes).
+/// and every one matters); screen updates coalesce through a dirty flag —
+/// the writer composes the frame at send time, so the diff baseline is
+/// always exactly what the client last received. (Frames must never be
+/// composed eagerly and queued: a dropped/overwritten diff would leave the
+/// client permanently missing those rows, and a backlog of frames froze
+/// slow embedded terminals for minutes.)
 struct ClientTx {
     control: std::sync::mpsc::SyncSender<String>,
-    frame: Arc<Mutex<Option<String>>>,
+    dirty: Arc<std::sync::atomic::AtomicBool>,
 }
 
 struct Daemon {
@@ -295,10 +376,6 @@ impl Daemon {
         if let Some(tx) = guard.as_ref() {
             let mut line = msg.to_string();
             line.push('\n');
-            if msg.get("t").and_then(Value::as_str) == Some("output") {
-                *tx.frame.lock().unwrap() = Some(line);
-                return;
-            }
             use std::sync::mpsc::TrySendError;
             match tx.control.try_send(line) {
                 Ok(()) => {}
@@ -311,14 +388,23 @@ impl Daemon {
         }
     }
 
+    /// Mark the active session's screen as needing a paint; the client
+    /// writer composes and sends the diff on its next idle tick.
+    fn mark_dirty(&self) {
+        if let Some(tx) = self.client.lock().unwrap().as_ref() {
+            tx.dirty.store(true, Ordering::SeqCst);
+        }
+    }
+
     /// Install `stream` as the attached client; returns when replaced.
-    fn install_client(&self, stream: UnixStream) {
+    fn install_client(self: &Arc<Self>, stream: UnixStream) {
         let (control_tx, control_rx) = std::sync::mpsc::sync_channel::<String>(256);
-        let frame: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let dirty = Arc::new(std::sync::atomic::AtomicBool::new(false));
         *self.client.lock().unwrap() = Some(ClientTx {
             control: control_tx,
-            frame: Arc::clone(&frame),
+            dirty: Arc::clone(&dirty),
         });
+        let daemon = Arc::clone(self);
         thread::spawn(move || {
             use std::sync::mpsc::RecvTimeoutError;
             let mut stream = stream;
@@ -330,11 +416,20 @@ impl Daemon {
                         }
                     }
                     Err(RecvTimeoutError::Timeout) => {
-                        let pending = frame.lock().unwrap().take();
-                        if let Some(line) = pending {
-                            if stream.write_all(line.as_bytes()).is_err() {
-                                return;
-                            }
+                        if !dirty.swap(false, Ordering::SeqCst) {
+                            continue;
+                        }
+                        let Some(session) = daemon.active_session() else {
+                            continue;
+                        };
+                        let Some(frame) = daemon.compose_frame(&session) else {
+                            continue;
+                        };
+                        let mut line =
+                            json!({ "t": "output", "b64": B64.encode(&frame) }).to_string();
+                        line.push('\n');
+                        if stream.write_all(line.as_bytes()).is_err() {
+                            return;
                         }
                     }
                     Err(RecvTimeoutError::Disconnected) => return,
@@ -419,21 +514,111 @@ impl Daemon {
         }
     }
 
-    /// Compose the client-facing frame: sidebar (when visible) + the
-    /// session grid shifted right, cursor adjusted to match.
-    fn compose_frame(&self, session: &Session) -> Vec<u8> {
+    /// Compose the client-facing frame as a delta against what the client
+    /// already shows: unchanged rows (byte-equal to our own previous
+    /// serialization) are skipped, whole-screen shifts become a native
+    /// scroll op plus the rows that slid in. Falls back to a full paint
+    /// whenever geometry changed or there is no baseline. Returns None
+    /// when nothing (not even the cursor) changed.
+    fn compose_frame(&self, session: &Session) -> Option<Vec<u8>> {
         let total = *self.size.lock().unwrap();
         let screen = session.parser.lock().unwrap().screen().clone();
-        let mut out: Vec<u8> = FRAME_PREFIX.to_vec();
         let offset = if self.sidebar_visible(total) {
-            render_sidebar(&mut out, &self.sidebar_items(), total.rows);
             SIDEBAR_WIDTH
         } else {
             0
         };
-        render_grid(&mut out, &screen, offset);
-        finish_frame(&mut out, &screen, offset);
-        out
+        let grid = grid_rows(&screen);
+        let sidebar = if offset > 0 {
+            sidebar_rows(&self.sidebar_items(), total.rows)
+        } else {
+            Vec::new()
+        };
+        let (cur_row, cur_col) = screen.cursor_position();
+        let cursor = (cur_row, cur_col, screen.hide_cursor());
+
+        let mut state = session.render_state.lock().unwrap();
+        let baseline = state
+            .as_ref()
+            .filter(|st| st.offset == offset && st.rows == total.rows && st.cols == total.cols);
+
+        let mut out: Vec<u8> = FRAME_PREFIX.to_vec();
+        match baseline {
+            None => {
+                for (i, bytes) in sidebar.iter().enumerate() {
+                    out.extend_from_slice(format!("\x1b[{};1H", i + 1).as_bytes());
+                    out.extend_from_slice(bytes);
+                }
+                for (i, bytes) in grid.iter().enumerate() {
+                    out.extend_from_slice(format!("\x1b[{};{}H", i + 1, offset + 1).as_bytes());
+                    out.extend_from_slice(bytes);
+                }
+            }
+            Some(st) => {
+                let mut grid_dirty: Vec<usize> = Vec::new();
+                let scroll = detect_scroll(&st.grid, &grid);
+                match scroll {
+                    Some(k) => {
+                        let ku = k.unsigned_abs();
+                        if k > 0 {
+                            out.extend_from_slice(format!("\x1b[{ku}S").as_bytes());
+                        } else {
+                            out.extend_from_slice(format!("\x1b[{ku}T").as_bytes());
+                        }
+                        // rows the shift didn't reproduce (slid-in rows plus
+                        // fixed chrome like the statusline) repaint explicitly
+                        grid_dirty = dirty_after_shift(&st.grid, &grid, k);
+                        // the scroll op moved the sidebar columns too, but
+                        // most sidebar rows are blank filler — shifted blank
+                        // over blank is byte-equal, so only repaint the rest
+                        for i in dirty_after_shift(&st.sidebar, &sidebar, k) {
+                            out.extend_from_slice(format!("\x1b[{};1H", i + 1).as_bytes());
+                            out.extend_from_slice(&sidebar[i]);
+                        }
+                    }
+                    None => {
+                        for (i, row) in grid.iter().enumerate() {
+                            if st.grid.get(i) != Some(row) {
+                                grid_dirty.push(i);
+                            }
+                        }
+                        for (i, bytes) in sidebar.iter().enumerate() {
+                            if st.sidebar.get(i) != Some(bytes) {
+                                out.extend_from_slice(format!("\x1b[{};1H", i + 1).as_bytes());
+                                out.extend_from_slice(bytes);
+                            }
+                        }
+                    }
+                }
+                if scroll.is_none()
+                    && out.len() == FRAME_PREFIX.len()
+                    && grid_dirty.is_empty()
+                    && st.cursor == cursor
+                {
+                    return None; // nothing changed at all
+                }
+                for i in grid_dirty {
+                    out.extend_from_slice(format!("\x1b[{};{}H", i + 1, offset + 1).as_bytes());
+                    out.extend_from_slice(&grid[i]);
+                }
+            }
+        }
+
+        out.extend_from_slice(
+            format!("\x1b[m\x1b[{};{}H", cursor.0 + 1, cursor.1 + 1 + offset).as_bytes(),
+        );
+        out.extend_from_slice(if cursor.2 { b"\x1b[?25l" } else { b"\x1b[?25h" });
+        out.extend_from_slice(b"\x1b[?2026l");
+
+        *state = Some(RenderState {
+            grid,
+            sidebar,
+            offset,
+            rows: total.rows,
+            cols: total.cols,
+            cursor,
+        });
+        Some(out)
     }
 
     fn status(&self, msg: &str) {
@@ -441,12 +626,11 @@ impl Daemon {
         self.send_client(&json!({ "t": "status", "msg": msg }));
     }
 
-    /// Paint the session's full screen to the client from the daemon's own
+    /// Schedule a full-screen paint of the session from the daemon's own
     /// virtual-screen state. Purely local — needs nothing from nvim.
     fn repaint(&self, session: &Session) {
-        let frame = self.compose_frame(session);
-        *session.last_frame.lock().unwrap() = Some(frame.clone());
-        self.send_client(&json!({ "t": "output", "b64": B64.encode(&frame) }));
+        *session.render_state.lock().unwrap() = None;
+        self.mark_dirty();
     }
 
     /// Guarantee this session's PTY and virtual screen match the client
@@ -462,7 +646,7 @@ impl Daemon {
                 .lock()
                 .unwrap()
                 .set_size(size.rows, size.cols);
-            *session.last_frame.lock().unwrap() = None;
+            *session.render_state.lock().unwrap() = None;
             *applied = (size.rows, size.cols);
         }
     }
@@ -515,7 +699,7 @@ impl Daemon {
                 .lock()
                 .unwrap()
                 .set_size(inner.rows, inner.cols);
-            *session.last_frame.lock().unwrap() = None;
+            *session.render_state.lock().unwrap() = None;
             *session.applied_size.lock().unwrap() = (inner.rows, inner.cols);
         }
     }
@@ -614,7 +798,7 @@ impl Daemon {
             writer: Mutex::new(writer),
             killer: Mutex::new(killer),
             parser: Mutex::new(vt100::Parser::new(size.rows, size.cols, 0)),
-            last_frame: Mutex::new(None),
+            render_state: Mutex::new(None),
             applied_size: Mutex::new((size.rows, size.cols)),
         });
         self.sessions.lock().unwrap().push(Arc::clone(&session));
@@ -632,20 +816,9 @@ impl Daemon {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
                         sess.parser.lock().unwrap().process(&buf[..n]);
-                        if daemon.active.load(Ordering::SeqCst) != id {
-                            continue;
+                        if daemon.active.load(Ordering::SeqCst) == id {
+                            daemon.mark_dirty();
                         }
-                        let frame = daemon.compose_frame(&sess);
-                        let mut last = sess.last_frame.lock().unwrap();
-                        if last.as_deref() == Some(frame.as_slice()) {
-                            continue;
-                        }
-                        *last = Some(frame.clone());
-                        drop(last);
-                        daemon.send_client(&json!({
-                            "t": "output",
-                            "b64": B64.encode(&frame),
-                        }));
                     }
                 }
             }
@@ -984,5 +1157,69 @@ mod sidebar_tests {
         let (fwd, clicks) = translate_sgr_mouse(b"hello", SIDEBAR_WIDTH);
         assert_eq!(fwd, b"hello");
         assert!(clicks.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod diff_tests {
+    use super::{detect_scroll, dirty_after_shift};
+
+    fn rows(texts: &[&str]) -> Vec<Vec<u8>> {
+        texts.iter().map(|t| t.as_bytes().to_vec()).collect()
+    }
+
+    fn numbered(range: std::ops::Range<usize>) -> Vec<Vec<u8>> {
+        range
+            .map(|i| format!("text line {i}").into_bytes())
+            .collect()
+    }
+
+    #[test]
+    fn detects_scroll_up_and_down() {
+        let old = numbered(0..20);
+        assert_eq!(detect_scroll(&old, &numbered(3..23)), Some(3));
+        assert_eq!(detect_scroll(&old, &numbered(2..22)), Some(2));
+
+        let mut down: Vec<Vec<u8>> = vec![b"new top".to_vec()];
+        down.extend(numbered(0..19));
+        assert_eq!(detect_scroll(&old, &down), Some(-1));
+
+        let unrelated = numbered(100..120);
+        assert_eq!(detect_scroll(&old, &unrelated), None);
+
+        // identical screens are not a scroll
+        assert_eq!(detect_scroll(&old, &old), None);
+    }
+
+    #[test]
+    fn scroll_detected_despite_fixed_chrome_rows() {
+        // an nvim screen: text rows scroll, statusline + ruler rows stay put
+        let mut old = numbered(0..18);
+        old.push(b"STATUSLINE file.txt".to_vec());
+        old.push(b"12,3  5%".to_vec());
+        let mut new = numbered(4..22);
+        new.push(b"STATUSLINE file.txt".to_vec());
+        new.push(b"16,3  9%".to_vec());
+        assert_eq!(detect_scroll(&old, &new), Some(4));
+        // dirty rows = 4 slid-in text rows + 2 chrome rows the shift moved
+        let dirty = dirty_after_shift(&old, &new, 4);
+        assert_eq!(dirty, vec![14, 15, 16, 17, 18, 19]);
+    }
+
+    #[test]
+    fn small_diffs_prefer_row_repaint_over_scroll() {
+        // only a couple of rows changed: repainting them beats scrolling
+        let old = numbered(0..20);
+        let mut new = numbered(0..20);
+        new[5] = b"edited".to_vec();
+        new[6] = b"also edited".to_vec();
+        assert_eq!(detect_scroll(&old, &new), None);
+    }
+
+    #[test]
+    fn tiny_screens_never_scroll_detect() {
+        let old = rows(&["a", "b"]);
+        let new = rows(&["b", "c"]);
+        assert_eq!(detect_scroll(&old, &new), None, "below threshold");
     }
 }
