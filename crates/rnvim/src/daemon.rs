@@ -93,11 +93,18 @@ fn push_color(sgr: &mut String, color: vt100::Color, fg: bool) {
 /// output so capable terminals apply the frame atomically.
 #[cfg_attr(not(test), allow(dead_code))] // exercised by the rendering tests
 fn full_frame(screen: &vt100::Screen) -> Vec<u8> {
-    let mut out: Vec<u8> = b"\x1b[?2026h\x1b[2J".to_vec();
+    let mut out: Vec<u8> = FRAME_PREFIX.to_vec();
     render_grid(&mut out, screen, 0);
     finish_frame(&mut out, screen, 0);
     out
 }
+
+/// Frames overwrite in place — every cell is painted every frame, so a
+/// clear would only add flicker on terminals without synchronized output
+/// (the visible blank between 2J and the repaint). The cursor hides for
+/// the duration of the paint. The one screen-unknown moment (attach /
+/// session switch) is handled by the CLIENT clearing on "switched".
+const FRAME_PREFIX: &[u8] = b"\x1b[?2026h\x1b[?25l";
 
 fn finish_frame(out: &mut Vec<u8>, screen: &vt100::Screen, col_offset: u16) {
     let (cursor_row, cursor_col) = screen.cursor_position();
@@ -316,7 +323,7 @@ impl Daemon {
             use std::sync::mpsc::RecvTimeoutError;
             let mut stream = stream;
             loop {
-                match control_rx.recv_timeout(std::time::Duration::from_millis(5)) {
+                match control_rx.recv_timeout(std::time::Duration::from_millis(16)) {
                     Ok(line) => {
                         if stream.write_all(line.as_bytes()).is_err() {
                             return;
@@ -417,7 +424,7 @@ impl Daemon {
     fn compose_frame(&self, session: &Session) -> Vec<u8> {
         let total = *self.size.lock().unwrap();
         let screen = session.parser.lock().unwrap().screen().clone();
-        let mut out: Vec<u8> = b"\x1b[?2026h\x1b[2J".to_vec();
+        let mut out: Vec<u8> = FRAME_PREFIX.to_vec();
         let offset = if self.sidebar_visible(total) {
             render_sidebar(&mut out, &self.sidebar_items(), total.rows);
             SIDEBAR_WIDTH
@@ -919,9 +926,10 @@ mod tests {
         let spaces = frame.iter().filter(|&&b| b == b' ').count();
         assert_eq!(spaces, 6 * 12 - 2, "every blank cell painted as a space");
         assert!(
-            text.starts_with("\x1b[?2026h\x1b[2J"),
-            "sync + defensive clear"
+            text.starts_with("\x1b[?2026h\x1b[?25l"),
+            "sync + hidden cursor, no clear (in-place overwrite is flicker-free)"
         );
+        assert!(!text.contains("\x1b[2J"), "no clears anywhere in frames");
         assert!(text.ends_with("\x1b[?2026l"), "sync end");
     }
 

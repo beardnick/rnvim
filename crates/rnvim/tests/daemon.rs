@@ -206,7 +206,7 @@ fn attach_edit_detach_reattach() {
             && m["b64"]
                 .as_str()
                 .and_then(|b| base64::engine::general_purpose::STANDARD.decode(b).ok())
-                .map(|bytes| bytes.starts_with(b"\x1b[?2026h\x1b[2J"))
+                .map(|bytes| bytes.starts_with(b"\x1b[?2026h\x1b[?25l"))
                 .unwrap_or(false)
     });
 
