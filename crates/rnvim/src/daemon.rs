@@ -139,15 +139,22 @@ fn full_frame(screen: &vt100::Screen) -> Vec<u8> {
     out
 }
 
+/// Channel to the attached client. Control messages queue (they are tiny
+/// and every one matters); output frames coalesce in a latest-wins slot —
+/// each frame is a complete screen, so a slow terminal skips straight to
+/// the newest state instead of replaying a growing backlog (which froze
+/// slow embedded terminals for minutes).
+struct ClientTx {
+    control: std::sync::mpsc::SyncSender<String>,
+    frame: Arc<Mutex<Option<String>>>,
+}
+
 struct Daemon {
     router: Arc<Router>,
     sessions: Mutex<Vec<Arc<Session>>>,
     active: AtomicU64,
     next_id: AtomicU64,
-    /// Bounded queue to the attached client's writer thread. A slow or
-    /// stalled client must never block a PTY reader (that would freeze
-    /// nvim); on overflow the client is dropped instead — it can reattach.
-    client: Mutex<Option<std::sync::mpsc::SyncSender<String>>>,
+    client: Mutex<Option<ClientTx>>,
     size: Mutex<PtySize>,
     router_socket: std::path::PathBuf,
     targets_file: Option<std::path::PathBuf>,
@@ -159,11 +166,16 @@ impl Daemon {
         if let Some(tx) = guard.as_ref() {
             let mut line = msg.to_string();
             line.push('\n');
+            if msg.get("t").and_then(Value::as_str) == Some("output") {
+                *tx.frame.lock().unwrap() = Some(line);
+                return;
+            }
             use std::sync::mpsc::TrySendError;
-            match tx.try_send(line) {
+            match tx.control.try_send(line) {
                 Ok(()) => {}
                 Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
-                    // Writer thread exits when its receiver is dropped.
+                    // Control overflow only happens if the client is gone
+                    // or wedged beyond saving; writer exits with the rx.
                     *guard = None;
                 }
             }
@@ -172,13 +184,31 @@ impl Daemon {
 
     /// Install `stream` as the attached client; returns when replaced.
     fn install_client(&self, stream: UnixStream) {
-        let (tx, rx) = std::sync::mpsc::sync_channel::<String>(512);
-        *self.client.lock().unwrap() = Some(tx);
+        let (control_tx, control_rx) = std::sync::mpsc::sync_channel::<String>(256);
+        let frame: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        *self.client.lock().unwrap() = Some(ClientTx {
+            control: control_tx,
+            frame: Arc::clone(&frame),
+        });
         thread::spawn(move || {
+            use std::sync::mpsc::RecvTimeoutError;
             let mut stream = stream;
-            for line in rx {
-                if stream.write_all(line.as_bytes()).is_err() {
-                    break;
+            loop {
+                match control_rx.recv_timeout(std::time::Duration::from_millis(5)) {
+                    Ok(line) => {
+                        if stream.write_all(line.as_bytes()).is_err() {
+                            return;
+                        }
+                    }
+                    Err(RecvTimeoutError::Timeout) => {
+                        let pending = frame.lock().unwrap().take();
+                        if let Some(line) = pending {
+                            if stream.write_all(line.as_bytes()).is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    Err(RecvTimeoutError::Disconnected) => return,
                 }
             }
         });

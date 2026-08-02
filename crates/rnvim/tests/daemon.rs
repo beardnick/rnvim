@@ -210,6 +210,40 @@ fn attach_edit_detach_reattach() {
                 .unwrap_or(false)
     });
 
+    // --- slow-consumer coalescing: burst input without reading, then
+    // drain — frames must coalesce to the latest state, not replay a
+    // backlog (a slow terminal must never fall minutes behind)
+    for _ in 0..40 {
+        send_keys(&mut stream, "j");
+        std::thread::sleep(Duration::from_millis(20));
+        send_keys(&mut stream, "k");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::thread::sleep(Duration::from_secs(1));
+    let mut output_frames = 0;
+    let drain_deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < drain_deadline {
+        use std::io::Read;
+        let mut chunk = [0u8; 256 * 1024];
+        match reader.stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => reader.buf.extend_from_slice(&chunk[..n]),
+            Err(_) => {}
+        }
+        while let Some(pos) = reader.buf.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = reader.buf.drain(..=pos).collect();
+            if let Ok(msg) = serde_json::from_slice::<Value>(&line) {
+                if is_type(&msg, "output") {
+                    output_frames += 1;
+                }
+            }
+        }
+    }
+    assert!(
+        output_frames < 15,
+        "slow consumer should get coalesced frames, got {output_frames}"
+    );
+
     // --- second session via the connect path the picker uses
     send(
         &mut stream,
