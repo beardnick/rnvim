@@ -26,7 +26,7 @@ require("rnvim").setup()
 -- Eager-load every rnvim module: user plugin managers may reset the
 -- runtimepath, and cached modules keep our autocmd callbacks working
 -- regardless.
-for _, mod in ipairs({ "workspaces", "rpc", "fs", "lsp", "term", "picker" }) do
+for _, mod in ipairs({ "workspaces", "rpc", "fs", "lsp", "term", "picker", "recipes" }) do
   pcall(require, "rnvim." .. mod)
 end
 

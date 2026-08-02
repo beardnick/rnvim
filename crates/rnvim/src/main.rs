@@ -3,6 +3,7 @@ mod daemon;
 mod deploy;
 mod lsp_proxy;
 mod nvim;
+mod registry;
 mod remotes;
 mod runtime;
 mod session;
@@ -56,6 +57,19 @@ enum Cmd {
     },
     /// Run the session daemon (started automatically; not for interactive use)
     Daemon,
+    /// mason-registry integration (install-recipe data source)
+    Registry {
+        #[command(subcommand)]
+        cmd: RegistryCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum RegistryCmd {
+    /// Print the install script for a package or server binary
+    Script { name: String },
+    /// Refresh the cached registry snapshot
+    Update,
 }
 
 fn main() -> Result<()> {
@@ -72,6 +86,15 @@ fn main() -> Result<()> {
             std::process::exit(code);
         }
         Some(Cmd::Daemon) => daemon::run_daemon(),
+        Some(Cmd::Registry { cmd }) => {
+            match cmd {
+                RegistryCmd::Script { name } => print!("{}", registry::script_for(&name)?),
+                RegistryCmd::Update => {
+                    registry::update()?;
+                }
+            }
+            Ok(())
+        }
         None => {
             // Headless runs (tests, scripting) bypass the daemon entirely.
             if !cli.headless_cmd.is_empty() {

@@ -154,14 +154,19 @@ pub struct WhichResult {
     pub path: Option<String>,
 }
 
+/// Run a caller-supplied script on the remote host. The agent supplies
+/// the environment (login shell, tools prefix on PATH, $RNVIM_TOOLS);
+/// what to run is the client's business — install recipes live there.
 #[derive(Debug, Serialize, Deserialize)]
-pub struct InstallParams {
-    pub name: String,
+pub struct RunParams {
+    pub script: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct InstallResult {
-    pub path: String,
+pub struct RunResult {
+    pub code: i32,
+    pub stdout: String,
+    pub stderr: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

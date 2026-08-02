@@ -107,4 +107,14 @@ scheme），为后续 LSP 代理的 URI 重写做的先手设计——翻译退�
 - [x] 发布工程：CI（fmt/clippy/test）+ tag 触发四平台构建（含 musl 静态 agent）发布到
   GitHub Release；客户端按需拉取远程平台的预编译 agent（本地经 `gh` 认证下载、缓存于
   `~/.rnvim/dist/`、SSH 推送——远程机器无需访问 GitHub）
-- 待做：协议快照测试、docker sshd 集成测试、下载校验和验证
+- [x] **LSP 依赖远程自动安装（mason-registry 数据源）**：缺服务器时自动装到远程
+  `~/.rnvim/tools/`。分层：agent 只提供通用 `exec.run`（登录 shell、tools 前缀、独立
+  线程执行）——**装什么、怎么装的知识全在客户端**：`rnvim registry script <name>` 从
+  mason-registry 快照（本地缓存，`rnvim registry update` 刷新）解析包规格生成自包含
+  POSIX 脚本，版本由 registry 钉死（不用 latest）；支持 pkg:github/npm/golang 三种
+  来源；用户可用 `vim.g.rnvim_lsp_recipes` 覆盖或新增任意配方。npm/go 走各自生态的
+  完整性校验；github 资产为 TLS + 版本钉死（registry 不含 hash）
+- [x] **用户配置集成（vscode-neovim 式）**：`vim.g.rnvim` 公开契约；
+  `~/.rnvim/config.json` 写 `{"user_config": true}` 显式启用后加载 `~/.config/nvim`
+  （插件数据仍隔离在 rnvim APPNAME 下），用户配置据 `vim.g.rnvim` 走 rnvim 分支
+- 待做：协议快照测试、docker sshd 集成测试、github 资产 hash 校验（等 registry 提供）

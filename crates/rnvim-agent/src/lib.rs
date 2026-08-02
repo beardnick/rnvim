@@ -5,8 +5,8 @@
 
 mod finder;
 
-mod install;
-pub use install::TOOLS_PATH;
+mod exec;
+pub use exec::TOOLS_PATH;
 
 use std::fs;
 use std::io::{self, BufRead, Write};
@@ -39,7 +39,7 @@ pub fn run_stdio() -> Result<()> {
         // Installs download for minutes; never block the request loop.
         // Responses are id-matched, so out-of-order delivery is fine.
         if let Ok(req) = serde_json::from_str::<Request>(&line) {
-            if req.method == "exec.install" {
+            if req.method == "exec.run" {
                 let stdout = Arc::clone(&stdout);
                 std::thread::spawn(move || {
                     let resp = match dispatch(&req.method, req.params) {
@@ -77,7 +77,7 @@ fn dispatch(method: &str, params: Value) -> Result<Value> {
         "fs.list" => fs_list(serde_json::from_value(params)?),
         "fs.findroot" => fs_findroot(serde_json::from_value(params)?),
         "exec.which" => exec_which(serde_json::from_value(params)?),
-        "exec.install" => exec_install(serde_json::from_value(params)?),
+        "exec.run" => exec_run(serde_json::from_value(params)?),
         "find.files" => finder::find_files(serde_json::from_value(params)?),
         "find.grep" => finder::find_grep(serde_json::from_value(params)?),
         other => Err(anyhow!("unknown method: {other}")),
@@ -240,7 +240,7 @@ fn exec_which(p: WhichParams) -> Result<Value> {
         .arg("-lc")
         .arg(format!(
             "PATH=\"{}:$PATH\" command -v '{}'",
-            install::TOOLS_PATH,
+            exec::TOOLS_PATH,
             p.name
         ))
         .output()
@@ -259,11 +259,15 @@ fn exec_which(p: WhichParams) -> Result<Value> {
     Ok(json!(WhichResult { path }))
 }
 
-/// Install an LSP server on this host from a known recipe. Runs on a
-/// dedicated thread (see run_stdio) — may take minutes.
-fn exec_install(p: InstallParams) -> Result<Value> {
-    let path = install::install(&p.name)?;
-    Ok(json!(InstallResult { path }))
+/// Run a client-supplied script (see exec.rs). Dispatched on its own
+/// thread by run_stdio — installs and builds can take minutes.
+fn exec_run(p: RunParams) -> Result<Value> {
+    let out = exec::run(&p.script)?;
+    Ok(json!(RunResult {
+        code: out.code,
+        stdout: out.stdout,
+        stderr: out.stderr,
+    }))
 }
 
 #[cfg(test)]

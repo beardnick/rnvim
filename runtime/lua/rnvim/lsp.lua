@@ -44,56 +44,58 @@ local rnvim_bin
 local which_cache = {}
 local warned = {}
 
--- Server binaries the agent knows how to install on the remote host
--- (self-contained release artifacts or a resident toolchain).
-local install_recipes = {
-  ["rust-analyzer"] = "rust-analyzer",
-  ["lua-language-server"] = "lua-language-server",
-  ["gopls"] = "gopls",
-  ["clangd"] = "clangd",
-  ["pyright-langserver"] = "pyright",
-  ["typescript-language-server"] = "typescript-language-server",
-}
+local recipes = require("rnvim.recipes")
 local installing = {}
 
 local function is_null(v)
   return v == nil or v == vim.NIL
 end
 
---- Install a missing server on the remote, then re-trigger attach for the
+--- Install a missing server on the remote: resolve its recipe (user table
+--- or mason registry), send the script to the agent's generic exec.run
+--- (the agent has no server knowledge), then re-trigger attach for the
 --- buffer that wanted it. One attempt per host+binary.
 local function try_install(bin, host, bufnr)
-  local recipe = install_recipes[bin]
   local key = host .. ":" .. bin
-  if not recipe then
-    if not warned[key] then
-      warned[key] = true
-      vim.notify(
-        ("[rnvim] %s not found on %s — install it there to enable LSP"):format(bin, host),
-        vim.log.levels.WARN
-      )
-    end
-    return
-  end
   if installing[key] then
     return
   end
   installing[key] = true
-  vim.notify(("[rnvim] installing %s on %s (first use)..."):format(bin, host))
-  rpc.request_async(host, "exec.install", { name = recipe }, function(err, res)
-    if err then
-      vim.notify(
-        ("[rnvim] could not install %s on %s: %s"):format(bin, host, err),
-        vim.log.levels.WARN
-      )
+
+  recipes.get(bin, function(script, resolve_err)
+    if not script then
+      if not warned[key] then
+        warned[key] = true
+        vim.notify(
+          ("[rnvim] no install recipe for %s (%s) — install it on %s manually"):format(
+            bin,
+            resolve_err or "unknown",
+            host
+          ),
+          vim.log.levels.WARN
+        )
+      end
       return
     end
-    which_cache[key] = true
-    vim.notify(("[rnvim] %s installed on %s (%s)"):format(bin, host, res.path))
-    if bufnr and vim.api.nvim_buf_is_valid(bufnr) then
-      -- Re-run the FileType machinery so vim.lsp.enable attaches now.
-      vim.api.nvim_exec_autocmds("FileType", { buffer = bufnr })
-    end
+    vim.notify(("[rnvim] installing %s on %s (first use)..."):format(bin, host))
+    rpc.request_async(host, "exec.run", { script = script }, function(err, res)
+      if err or res.code ~= 0 then
+        local reason = err
+          or (res.stderr:match("([^\n]+)%s*$") or ("exit " .. res.code))
+        vim.notify(
+          ("[rnvim] could not install %s on %s: %s"):format(bin, host, reason),
+          vim.log.levels.WARN
+        )
+        return
+      end
+      which_cache[key] = true
+      local path = res.stdout:match("([^\n]+)%s*\n?$") or "?"
+      vim.notify(("[rnvim] %s installed on %s (%s)"):format(bin, host, path))
+      if bufnr and vim.api.nvim_buf_is_valid(bufnr) then
+        -- Re-run the FileType machinery so vim.lsp.enable attaches now.
+        vim.api.nvim_exec_autocmds("FileType", { buffer = bufnr })
+      end
+    end)
   end)
 end
 
