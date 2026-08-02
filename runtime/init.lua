@@ -21,18 +21,18 @@ vim.o.updatetime = 300
 -- prompt pending across detach/reattach also stalls the repaint RPC.
 vim.opt.shortmess:append("aT")
 
-require("rnvim").setup()
-
--- Eager-load every rnvim module: user plugin managers may reset the
--- runtimepath, and cached modules keep our autocmd callbacks working
--- regardless.
+-- Eager-load every rnvim module (no side effects — just module caching):
+-- user plugin managers may reset the runtimepath, and cached modules keep
+-- our callbacks working regardless.
 for _, mod in ipairs({ "workspaces", "rpc", "fs", "lsp", "term", "picker", "recipes" }) do
   pcall(require, "rnvim." .. mod)
 end
 
 -- Explicit opt-in (user_config in ~/.rnvim/config.json): load the user's
--- own nvim config. It sees vim.g.rnvim and takes its rnvim branch; plugin
--- data still lives under the rnvim NVIM_APPNAME, fully isolated.
+-- own nvim config BEFORE rnvim core setup, so LSP registration sees the
+-- user's completion engine (capabilities) and rnvim keymaps win conflicts.
+-- It sees vim.g.rnvim and takes its rnvim branch; plugin data still lives
+-- under the rnvim NVIM_APPNAME, fully isolated.
 if vim.env.RNVIM_USER_CONFIG == "1" then
   local user_init = vim.fn.expand("~/.config/nvim/init.lua")
   if vim.uv.fs_stat(user_init) then
@@ -44,6 +44,8 @@ if vim.env.RNVIM_USER_CONFIG == "1" then
     vim.notify("[rnvim] user_config enabled but ~/.config/nvim/init.lua not found", vim.log.levels.WARN)
   end
 end
+
+require("rnvim").setup()
 
 -- Overlay: small additions without adopting a whole config.
 -- Lives outside the managed runtime so upgrades never touch it.

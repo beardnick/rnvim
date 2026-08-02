@@ -54,8 +54,8 @@ end
 --- Install a missing server on the remote. A user recipe (full-control
 --- script) runs directly via exec.run; otherwise the broker's
 --- session.install orchestrates: registry plan resolved locally, artifact
---- downloaded on the LOCAL machine and staged through the agent — the
---- remote needs no GitHub access. One attempt per host+binary; attach is
+--- fetched by the agent's native HTTP client on the remote, then unpacked
+--- by a network-free script. One attempt per host+binary; attach is
 --- re-triggered on success.
 local function try_install(bin, host, bufnr)
   local key = host .. ":" .. bin
@@ -155,19 +155,22 @@ function M.register_workspace(ws)
         end
         on_dir(ws.ws_root .. root)
       end,
+      -- NOTE: passing capabilities REPLACES nvim's defaults, so always
+      -- start from make_client_capabilities() — losing the defaults kills
+      -- workDoneProgress (fidget's progress UI), snippets, inlay hints...
       capabilities = (function()
-        local caps = {
+        local caps = vim.lsp.protocol.make_client_capabilities()
+        -- If the user's config brought a completion engine, layer its
+        -- capabilities on top for the remote servers too.
+        local ok, blink = pcall(require, "blink.cmp")
+        if ok and blink.get_lsp_capabilities then
+          caps = blink.get_lsp_capabilities(caps)
+        end
+        return vim.tbl_deep_extend("force", caps, {
           workspace = {
             didChangeWatchedFiles = { dynamicRegistration = false },
           },
-        }
-        -- If the user's config brought a completion engine, advertise its
-        -- capabilities to the remote servers too.
-        local ok, blink = pcall(require, "blink.cmp")
-        if ok and blink.get_lsp_capabilities then
-          caps = vim.tbl_deep_extend("force", blink.get_lsp_capabilities(), caps)
-        end
-        return caps
+        })
       end)(),
     })
   end
