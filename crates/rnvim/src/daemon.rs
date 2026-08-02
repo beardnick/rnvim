@@ -14,8 +14,10 @@
 //!     {t:"sessions", items:[{id,title,active}]}
 //!     {t:"switched", id, title} {t:"error", msg} {t:"empty"}
 //!
-//! No terminal emulation: only one session is visible at a time, and every
-//! repaint is requested from nvim itself over its RPC socket.
+//! Rendering: every session's PTY output feeds a vt100 virtual screen; the
+//! client is painted exclusively from that state — minimal diffs while
+//! streaming, a full deterministic frame on attach/switch. nvim is never
+//! asked to redraw, and no escape sequence can be cut mid-stream.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -44,10 +46,14 @@ struct Session {
     master: Mutex<Box<dyn portable_pty::MasterPty + Send>>,
     writer: Mutex<Box<dyn Write + Send>>,
     killer: Mutex<Box<dyn ChildKiller + Send>>,
-    /// nvim --listen socket: lets the daemon ask this instance to repaint
-    /// deterministically (SIGWINCH-only redraws proved unreliable).
-    nvim_socket: std::path::PathBuf,
-    nvim_bin: std::path::PathBuf,
+    /// The session's virtual screen: every PTY byte goes through this
+    /// terminal emulator, and clients are painted purely from its state
+    /// (full frame on switch/attach, minimal diffs while streaming). This
+    /// is what makes detach/switch rendering deterministic — no reliance
+    /// on nvim redrawing, no escape sequences cut mid-stream.
+    parser: Mutex<vt100::Parser>,
+    /// Screen state as last painted to the client, if any.
+    last_sent: Mutex<Option<vt100::Screen>>,
 }
 
 struct Daemon {
@@ -126,45 +132,14 @@ impl Daemon {
         json!({ "t": "sessions", "items": items })
     }
 
-    /// Make the session repaint its full screen: ensure the PTY matches the
-    /// client size, then ask nvim over its RPC socket. `execute()` keeps
-    /// this mode-safe (no key injection). The RPC runs on its own thread
-    /// with a hard timeout: nvim blocks RPC while a modal prompt is up, and
-    /// a stuck repaint must never wedge the control loop.
+    /// Paint the session's full screen to the client from the daemon's own
+    /// virtual-screen state. Purely local — needs nothing from nvim.
     fn repaint(&self, session: &Session) {
-        let size = *self.size.lock().unwrap();
-        {
-            let master = session.master.lock().unwrap();
-            let _ = master.resize(PtySize {
-                rows: size.rows.saturating_sub(1),
-                ..size
-            });
-            thread::sleep(std::time::Duration::from_millis(50));
-            let _ = master.resize(size);
-        }
-        let bin = session.nvim_bin.clone();
-        let sock = session.nvim_socket.clone();
-        thread::spawn(move || {
-            let Ok(mut child) = std::process::Command::new(bin)
-                .arg("--server")
-                .arg(&sock)
-                .args(["--remote-expr", "execute('redraw!')"])
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-            else {
-                return;
-            };
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-            while std::time::Instant::now() < deadline {
-                match child.try_wait() {
-                    Ok(Some(_)) | Err(_) => return,
-                    Ok(None) => thread::sleep(std::time::Duration::from_millis(50)),
-                }
-            }
-            let _ = child.kill();
-        });
+        let screen = session.parser.lock().unwrap().screen().clone();
+        let mut bytes = b"\x1b[2J\x1b[H".to_vec();
+        bytes.extend_from_slice(&screen.contents_formatted());
+        *session.last_sent.lock().unwrap() = Some(screen);
+        self.send_client(&json!({ "t": "output", "b64": B64.encode(&bytes) }));
     }
 
     fn focus(&self, id: u64) {
@@ -197,6 +172,11 @@ impl Daemon {
         *self.size.lock().unwrap() = size;
         for session in self.sessions.lock().unwrap().iter() {
             let _ = session.master.lock().unwrap().resize(size);
+            session
+                .parser
+                .lock()
+                .unwrap()
+                .set_size(size.rows, size.cols);
         }
     }
 
@@ -285,25 +265,46 @@ impl Daemon {
             master: Mutex::new(pair.master),
             writer: Mutex::new(writer),
             killer: Mutex::new(killer),
-            nvim_socket,
-            nvim_bin: plan.bin.clone(),
+            parser: Mutex::new(vt100::Parser::new(size.rows, size.cols, 0)),
+            last_sent: Mutex::new(None),
         });
         self.sessions.lock().unwrap().push(Arc::clone(&session));
 
-        // Drain the PTY forever (nvim blocks on a full pipe otherwise);
-        // forward only while this session is the active one.
+        // Drain the PTY forever (nvim blocks on a full pipe otherwise) into
+        // the virtual screen; while active, paint the client with minimal
+        // diffs of that screen state.
         let daemon = Arc::clone(self);
-        let socket_to_clean = session.nvim_socket.clone();
+        let sess = Arc::clone(&session);
+        let socket_to_clean = nvim_socket.clone();
         thread::spawn(move || {
             let mut buf = [0u8; 16 * 1024];
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
-                        if daemon.active.load(Ordering::SeqCst) == id {
+                        let screen = {
+                            let mut parser = sess.parser.lock().unwrap();
+                            parser.process(&buf[..n]);
+                            parser.screen().clone()
+                        };
+                        if daemon.active.load(Ordering::SeqCst) != id {
+                            continue;
+                        }
+                        let mut last = sess.last_sent.lock().unwrap();
+                        let bytes = match last.as_ref() {
+                            Some(prev) => screen.contents_diff(prev),
+                            None => {
+                                let mut b = b"\x1b[2J\x1b[H".to_vec();
+                                b.extend_from_slice(&screen.contents_formatted());
+                                b
+                            }
+                        };
+                        *last = Some(screen);
+                        drop(last);
+                        if !bytes.is_empty() {
                             daemon.send_client(&json!({
                                 "t": "output",
-                                "b64": B64.encode(&buf[..n]),
+                                "b64": B64.encode(&bytes),
                             }));
                         }
                     }

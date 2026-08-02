@@ -19,6 +19,7 @@ base64.workspace = true
 dialoguer = { version = "0.11", features = ["fuzzy-select"] }
 portable-pty = "0.9"
 libc = "0.2"
+vt100 = "0.15"
 
 [dev-dependencies]
 tempfile.workspace = true
