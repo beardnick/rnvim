@@ -1,15 +1,16 @@
--- fzf-style picker over the remote workspace: fuzzy file finding and live
--- grep. All matching happens on the remote agent (nucleo + ripgrep engine);
--- only the top results cross the wire, so huge repos stay responsive.
+-- fzf-style picker: fuzzy file finding and live grep over the current
+-- workspace (matching runs on that workspace's remote agent), plus the
+-- connect switcher that opens additional workspaces in new tabs.
 --
---   <C-p> / :RnvimFiles   fuzzy file jump
---   <C-g> / :RnvimGrep    live grep
+--   <C-p> / :RnvimFiles     fuzzy file jump (current workspace)
+--   <C-g> / :RnvimGrep      live grep (current workspace)
+--   :RnvimConnect           open another remote target in a new tab
 --   <CR> open  <C-n>/<C-p>/<Up>/<Down> move  <C-q> → quickfix  <Esc> close
 
 local rpc = require("rnvim.rpc")
+local workspaces = require("rnvim.workspaces")
 
 local M = {}
-local cfg
 local state
 
 local function close()
@@ -62,7 +63,6 @@ local function search(query)
   state.gen = state.gen + 1
   local gen = state.gen
   if state.mode == "connect" then
-    -- Local candidate list; no rpc involved.
     local q = query:lower()
     local items = {}
     for _, item in ipairs(state.all_items) do
@@ -81,33 +81,38 @@ local function search(query)
     return
   end
   local method = state.mode == "files" and "find.files" or "find.grep"
-  rpc.request_async(method, { root = state.root, query = query, limit = 100 }, function(err, res)
-    if not state or gen ~= state.gen then
-      return
-    end
-    if err then
-      vim.notify("[rnvim] search failed: " .. err, vim.log.levels.ERROR)
-      return
-    end
-    local items = {}
-    if state.mode == "files" then
-      for _, f in ipairs(res.files or {}) do
-        items[#items + 1] = { display = f, path = f }
+  rpc.request_async(
+    state.ws.host,
+    method,
+    { root = state.root, query = query, limit = 100 },
+    function(err, res)
+      if not state or gen ~= state.gen then
+        return
       end
-    else
-      for _, m in ipairs(res.matches or {}) do
-        items[#items + 1] = {
-          display = ("%s:%d: %s"):format(m.path, m.line, m.text),
-          path = m.path,
-          line = m.line,
-          col = m.col,
-        }
+      if err then
+        vim.notify("[rnvim] search failed: " .. err, vim.log.levels.ERROR)
+        return
       end
+      local items = {}
+      if state.mode == "files" then
+        for _, f in ipairs(res.files or {}) do
+          items[#items + 1] = { display = f, path = f }
+        end
+      else
+        for _, m in ipairs(res.matches or {}) do
+          items[#items + 1] = {
+            display = ("%s:%d: %s"):format(m.path, m.line, m.text),
+            path = m.path,
+            line = m.line,
+            col = m.col,
+          }
+        end
+      end
+      state.items = items
+      state.selected = 1
+      render()
     end
-    state.items = items
-    state.selected = 1
-    render()
-  end)
+  )
 end
 
 local function current_query()
@@ -123,7 +128,17 @@ local function on_change()
 end
 
 local function target_path(item)
-  return cfg.ws_root .. state.root .. "/" .. item.path
+  return state.ws.ws_root .. state.root .. "/" .. item.path
+end
+
+--- Open `info` (a session.connect result) as a workspace in a new tab.
+local function open_workspace(info)
+  local ws = workspaces.register(info)
+  require("rnvim.lsp").register_workspace(ws)
+  workspaces.last_active = ws
+  vim.cmd.tabnew()
+  vim.t.rnvim_ws = ws.slug
+  vim.cmd.edit(vim.fn.fnameescape(ws.ws_root .. info.abs:gsub("/+$", "")))
 end
 
 local function accept()
@@ -137,27 +152,15 @@ local function accept()
   local item = state.items[state.selected]
 
   if state.mode == "connect" then
-    local handoff = M.connect_cfg and M.connect_cfg.handoff
     close()
-    if not handoff or handoff == "" then
-      vim.notify("[rnvim] no handoff channel (RNVIM_HANDOFF unset)", vim.log.levels.ERROR)
-      return
-    end
-    local f = io.open(handoff, "w")
-    if not f then
-      vim.notify("[rnvim] cannot write " .. handoff, vim.log.levels.ERROR)
-      return
-    end
-    f:write(item.target)
-    f:close()
-    local ok = pcall(vim.cmd, "qa")
-    if not ok then
-      os.remove(handoff)
-      vim.notify(
-        "[rnvim] unsaved buffers — save them, then :RnvimConnect again",
-        vim.log.levels.WARN
-      )
-    end
+    vim.notify("[rnvim] connecting to " .. item.target .. "...")
+    rpc.request_async(nil, "session.connect", { target = item.target }, function(err, info)
+      if err then
+        vim.notify("[rnvim] connect failed: " .. err, vim.log.levels.ERROR)
+        return
+      end
+      open_workspace(info)
+    end)
     return
   end
 
@@ -187,25 +190,25 @@ local function to_quickfix()
   vim.cmd.copen()
 end
 
---- Project root on the remote: nearest .git above the session entry,
---- falling back to the entry directory itself. Cached per session.
-local function project_root()
-  if M._root then
-    return M._root
+--- Project root on the workspace's remote: nearest .git above its entry,
+--- falling back to the entry directory. Cached on the workspace.
+local function project_root(ws)
+  if ws.project_root then
+    return ws.project_root
   end
-  local entry = vim.env.RNVIM_REMOTE_ENTRY or "/"
-  local ok, res = pcall(rpc.request, "fs.findroot", { path = entry, markers = { ".git" } })
+  local entry = ws.entry or "/"
+  local ok, res = pcall(rpc.request, ws.host, "fs.findroot", { path = entry, markers = { ".git" } })
   if ok and res.root and res.root ~= vim.NIL then
-    M._root = res.root
+    ws.project_root = res.root
   else
-    local ok_stat, st = pcall(rpc.request, "fs.stat", { path = entry })
+    local ok_stat, st = pcall(rpc.request, ws.host, "fs.stat", { path = entry })
     if ok_stat and st.kind == "dir" then
-      M._root = entry
+      ws.project_root = entry
     else
-      M._root = vim.fs.dirname(entry) or "/"
+      ws.project_root = vim.fs.dirname(entry) or "/"
     end
   end
-  return M._root
+  return ws.project_root
 end
 
 --- Load connect candidates: recent workspaces first, then ssh hosts.
@@ -233,7 +236,16 @@ function M.open(mode)
   if state then
     close()
   end
-  local root = mode ~= "connect" and project_root() or nil
+
+  local ws, root
+  if mode ~= "connect" then
+    ws = workspaces.current()
+    if not ws then
+      vim.notify("[rnvim] no active workspace — :RnvimConnect first", vim.log.levels.WARN)
+      return
+    end
+    root = project_root(ws)
+  end
 
   local columns, total_lines = vim.o.columns, vim.o.lines
   local width = math.min(math.floor(columns * 0.8), 120)
@@ -246,6 +258,13 @@ function M.open(mode)
   vim.bo[prompt_buf].buftype = "prompt"
   vim.b[list_buf].rnvim_picker = true
 
+  local title
+  if mode == "connect" then
+    title = " rnvim connect · <CR> opens in a new tab "
+  else
+    title = (" rnvim %s: %s:%s "):format(mode, ws.host, root)
+  end
+
   local list_win = vim.api.nvim_open_win(list_buf, false, {
     relative = "editor",
     row = row,
@@ -254,7 +273,7 @@ function M.open(mode)
     height = height,
     style = "minimal",
     border = "rounded",
-    title = root and (" rnvim %s: %s "):format(mode, root) or (" rnvim %s "):format(mode),
+    title = title,
     title_pos = "center",
   })
   local prompt_win = vim.api.nvim_open_win(prompt_buf, true, {
@@ -273,6 +292,7 @@ function M.open(mode)
 
   state = {
     mode = mode,
+    ws = ws,
     root = root,
     items = {},
     all_items = mode == "connect" and connect_items() or nil,
@@ -323,29 +343,26 @@ function M.open(mode)
   search("")
 end
 
---- Remote-workspace pickers; requires an active session (rpc).
+--- Workspace pickers + the connect switcher.
 function M.setup(opts)
-  cfg = opts
+  M.connect_cfg = { targets = opts.targets }
+
   vim.api.nvim_create_user_command("RnvimFiles", function()
     M.open("files")
   end, { desc = "rnvim: fuzzy find files" })
   vim.api.nvim_create_user_command("RnvimGrep", function()
     M.open("grep")
   end, { desc = "rnvim: live grep" })
+  vim.api.nvim_create_user_command("RnvimConnect", function()
+    M.open("connect")
+  end, { desc = "rnvim: open a remote target in a new tab" })
+
   vim.keymap.set("n", "<C-p>", function()
     M.open("files")
   end, { desc = "rnvim: fuzzy find files" })
   vim.keymap.set("n", "<C-g>", function()
     M.open("grep")
   end, { desc = "rnvim: live grep" })
-end
-
---- Target switcher; works in every mode (local editor included).
-function M.setup_connect(opts)
-  M.connect_cfg = opts
-  vim.api.nvim_create_user_command("RnvimConnect", function()
-    M.open("connect")
-  end, { desc = "rnvim: connect to a remote target" })
 end
 
 return M

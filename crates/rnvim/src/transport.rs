@@ -2,11 +2,10 @@
 //! ssh (remote) or a plain subprocess (loopback). QUIC comes later behind the
 //! same seam.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::BufReader;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
-use anyhow::{bail, Context, Result};
-use rnvim_proto::{Request, Response};
+use anyhow::{Context, Result};
 
 pub struct AgentConn {
     /// Kept only so the process isn't detached from us; the agent exits by
@@ -43,26 +42,5 @@ impl AgentConn {
         let mut cmd = Command::new("ssh");
         cmd.args(["-o", "BatchMode=yes", host, remote_cmd]);
         Self::from_command(cmd, "ssh agent")
-    }
-
-    /// Blocking request/response, used before the session broker takes over
-    /// the pipes (handshake, initial path resolution).
-    pub fn request(&mut self, req: &Request) -> Result<Response> {
-        let mut line = serde_json::to_string(req)?;
-        line.push('\n');
-        self.stdin
-            .write_all(line.as_bytes())
-            .context("write to agent")?;
-        self.stdin.flush()?;
-
-        let mut resp_line = String::new();
-        let n = self
-            .stdout
-            .read_line(&mut resp_line)
-            .context("read from agent")?;
-        if n == 0 {
-            bail!("agent closed the connection (ssh failed or agent crashed)");
-        }
-        serde_json::from_str(resp_line.trim()).context("decode agent response")
     }
 }

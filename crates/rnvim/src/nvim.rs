@@ -81,14 +81,15 @@ pub fn ensure_nvim() -> Result<PathBuf> {
 
 pub struct LaunchOpts {
     pub socket: Option<PathBuf>,
+    /// Parent directory of every workspace prefix (~/.rnvim/ws).
+    pub ws_base: Option<PathBuf>,
+    /// Workspace prefix of the initial workspace, if any.
     pub ws_root: Option<PathBuf>,
     pub host: Option<String>,
     /// Resolved remote absolute path the session opened at (picker root discovery).
     pub remote_entry: Option<String>,
     /// Candidate list for the in-editor connect picker.
     pub targets_file: Option<PathBuf>,
-    /// File the connect picker writes the next target into before quitting.
-    pub handoff_file: Option<PathBuf>,
     /// File or directory to open (already mapped into the workspace prefix).
     pub entry: Option<PathBuf>,
     pub headless_cmds: Vec<String>,
@@ -124,8 +125,8 @@ pub fn launch(opts: LaunchOpts) -> Result<i32> {
     if let Some(targets) = &opts.targets_file {
         cmd.env("RNVIM_TARGETS", targets);
     }
-    if let Some(handoff) = &opts.handoff_file {
-        cmd.env("RNVIM_HANDOFF", handoff);
+    if let Some(base) = &opts.ws_base {
+        cmd.env("RNVIM_WS_BASE", base);
     }
 
     if !opts.headless_cmds.is_empty() {

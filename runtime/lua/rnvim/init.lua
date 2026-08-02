@@ -1,36 +1,35 @@
 local M = {}
 
---- Wire the remote session up if the client launched us with one.
---- Without RNVIM_SOCKET this is a plain local editor: only the target
---- switcher (:RnvimConnect) is wired up.
+--- Wire the session up. The broker socket always exists (the client runs
+--- it even for a bare local editor), so the connect switcher is always
+--- available; an initial workspace is registered when the client passed one.
 function M.setup()
-  require("rnvim.picker").setup_connect({
-    targets = vim.env.RNVIM_TARGETS,
-    handoff = vim.env.RNVIM_HANDOFF,
-  })
-
   local socket = vim.env.RNVIM_SOCKET
   if not socket or socket == "" then
     return
   end
 
-  local ws_root = vim.env.RNVIM_WS_ROOT
-  if not ws_root or ws_root == "" then
-    vim.notify("[rnvim] RNVIM_SOCKET set but RNVIM_WS_ROOT missing", vim.log.levels.ERROR)
-    return
-  end
-
-  local opts = {
-    ws_root = ws_root:gsub("/+$", ""),
-    host = vim.env.RNVIM_HOST or "remote",
-    rnvim_bin = vim.env.RNVIM_BIN,
-  }
+  local workspaces = require("rnvim.workspaces")
+  workspaces.setup()
 
   require("rnvim.rpc").connect(socket)
-  require("rnvim.fs").setup(opts)
-  require("rnvim.lsp").setup(opts)
-  require("rnvim.term").setup(opts)
-  require("rnvim.picker").setup(opts)
+  require("rnvim.fs").setup()
+  require("rnvim.lsp").setup({ rnvim_bin = vim.env.RNVIM_BIN })
+  require("rnvim.term").setup()
+  require("rnvim.picker").setup({ targets = vim.env.RNVIM_TARGETS })
+
+  local host, ws_root = vim.env.RNVIM_HOST, vim.env.RNVIM_WS_ROOT
+  if host and host ~= "" and ws_root and ws_root ~= "" then
+    local ws = workspaces.register({
+      host = host,
+      slug = vim.fs.basename(ws_root),
+      ws_root = ws_root,
+      abs = vim.env.RNVIM_REMOTE_ENTRY,
+    })
+    require("rnvim.lsp").register_workspace(ws)
+    workspaces.last_active = ws
+    vim.t.rnvim_ws = ws.slug
+  end
 end
 
 return M

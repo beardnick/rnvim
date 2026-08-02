@@ -68,23 +68,12 @@ fn main() -> Result<()> {
             std::process::exit(code);
         }
         None => {
-            let interactive = cli.headless_cmd.is_empty();
             let mut target = cli.target;
-            if target.is_none() && interactive {
+            if target.is_none() && cli.headless_cmd.is_empty() {
                 target = remotes::select_target()?;
             }
-            // Sessions chain: the in-editor connect picker hands the next
-            // target back, and we reopen straight into it.
-            loop {
-                let outcome = match &target {
-                    Some(t) => session::run_remote(t, &cli.headless_cmd)?,
-                    None => session::run_local_editor(&cli.headless_cmd)?,
-                };
-                match outcome.next_target {
-                    Some(next) if interactive => target = Some(next),
-                    _ => std::process::exit(outcome.code),
-                }
-            }
+            let code = session::run(target.as_deref(), &cli.headless_cmd)?;
+            std::process::exit(code);
         }
     }
 }

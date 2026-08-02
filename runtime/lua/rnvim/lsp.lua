@@ -1,13 +1,12 @@
--- First-party LSP integration: every server runs on the remote host behind
--- `rnvim lsp-proxy` (prefix path rewriting), root detection and availability
--- probing go through the agent.
+-- First-party LSP integration, multi-workspace: each connected workspace
+-- registers its own copies of the server configs (name-suffixed by slug),
+-- every server runs on that workspace's host behind `rnvim lsp-proxy`.
 
 local rpc = require("rnvim.rpc")
+local workspaces = require("rnvim.workspaces")
 
 local M = {}
 
--- Built-in server set. Deliberately small and first-party (no lspconfig
--- dependency); each entry is cmd + filetypes + remote root markers.
 local servers = {
   gopls = {
     cmd = { "gopls" },
@@ -41,6 +40,7 @@ local servers = {
   },
 }
 
+local rnvim_bin
 local which_cache = {}
 local warned = {}
 
@@ -49,62 +49,74 @@ local function is_null(v)
 end
 
 local function server_available(bin, host)
-  if which_cache[bin] == nil then
-    local ok, res = pcall(rpc.request, "exec.which", { name = bin })
-    which_cache[bin] = ok and not is_null(res.path)
+  local key = host .. ":" .. bin
+  if which_cache[key] == nil then
+    local ok, res = pcall(rpc.request, host, "exec.which", { name = bin })
+    which_cache[key] = ok and not is_null(res.path)
   end
-  if not which_cache[bin] and not warned[bin] then
-    warned[bin] = true
+  if not which_cache[key] and not warned[key] then
+    warned[key] = true
     vim.notify(
       ("[rnvim] %s not found on %s — install it there to enable LSP"):format(bin, host),
       vim.log.levels.WARN
     )
   end
-  return which_cache[bin]
+  return which_cache[key]
 end
 
-function M.setup(opts)
-  if not opts.rnvim_bin or opts.rnvim_bin == "" then
+--- Register + enable the server set for one workspace.
+function M.register_workspace(ws)
+  if ws.lsp_registered then
+    return
+  end
+  ws.lsp_registered = true
+  if not rnvim_bin or rnvim_bin == "" then
     vim.notify("[rnvim] RNVIM_BIN not set; LSP disabled", vim.log.levels.WARN)
     return
   end
 
+  local suffix = ws.slug:gsub("[^%w_]", "_")
+  local names = {}
   for name, def in pairs(servers) do
-    local proxy_cmd = { opts.rnvim_bin, "lsp-proxy", "--host", opts.host, "--ws-root", opts.ws_root, "--" }
+    local proxy_cmd = { rnvim_bin, "lsp-proxy", "--host", ws.host, "--ws-root", ws.ws_root, "--" }
     vim.list_extend(proxy_cmd, def.cmd)
+    local cfg_name = ("%s_%s"):format(name, suffix)
+    names[#names + 1] = cfg_name
 
-    vim.lsp.config(name, {
+    vim.lsp.config(cfg_name, {
       cmd = proxy_cmd,
       filetypes = def.filetypes,
       root_dir = function(bufnr, on_dir)
-        if not server_available(def.cmd[1], opts.host) then
-          return
-        end
         local file = vim.api.nvim_buf_get_name(bufnr)
-        if not vim.startswith(file, opts.ws_root) then
+        if workspaces.of_file(file) ~= ws then
+          return -- another workspace's copy will pick this buffer up
+        end
+        if not server_available(def.cmd[1], ws.host) then
           return
         end
-        local remote = file:sub(#opts.ws_root + 1)
+        local remote = workspaces.remote_path(file, ws)
         local root
-        local ok, res = pcall(rpc.request, "fs.findroot", { path = remote, markers = def.markers })
+        local ok, res =
+          pcall(rpc.request, ws.host, "fs.findroot", { path = remote, markers = def.markers })
         if ok and not is_null(res.root) then
           root = res.root
         else
           root = vim.fs.dirname(remote)
         end
-        on_dir(opts.ws_root .. root)
+        on_dir(ws.ws_root .. root)
       end,
       capabilities = {
         workspace = {
-          -- Local file watching would watch the (empty) local prefix; the
-          -- remote watcher lands with the QUIC transport milestone.
           didChangeWatchedFiles = { dynamicRegistration = false },
         },
       },
     })
   end
+  vim.lsp.enable(names)
+end
 
-  vim.lsp.enable(vim.tbl_keys(servers))
+function M.setup(opts)
+  rnvim_bin = opts.rnvim_bin
 
   -- Definition-jump keymaps nvim does not ship by default (gd is the old
   -- "local declaration" motion). grr/gri/grn/gra/K/CTRL-] are built-ins.

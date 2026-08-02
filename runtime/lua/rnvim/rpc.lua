@@ -59,23 +59,33 @@ function M.connect(path)
   end)
 end
 
+local function encode(id, host, method, params)
+  local payload = { id = id, method = method, params = params or vim.empty_dict() }
+  if host then
+    payload.host = host
+  end
+  return vim.json.encode(payload) .. "\n"
+end
+
 --- Fire-and-callback request; `cb(err, result)` runs on the main loop.
 --- Never blocks — this is what interactive UIs (picker) must use.
-function M.request_async(method, params, cb)
+--- `host` routes to that workspace's agent; nil for broker methods
+--- (session.*).
+function M.request_async(host, method, params, cb)
   local id = M.next_id
   M.next_id = id + 1
   M.pending[id] = { cb = cb }
-  pipe:write(vim.json.encode({ id = id, method = method, params = params or vim.empty_dict() }) .. "\n")
+  pipe:write(encode(id, host, method, params))
 end
 
 --- Send a request and wait for its response. Errors on timeout or remote error.
-function M.request(method, params, timeout_ms)
+function M.request(host, method, params, timeout_ms)
   timeout_ms = timeout_ms or 30000
   local id = M.next_id
   M.next_id = id + 1
   M.pending[id] = { done = false }
 
-  pipe:write(vim.json.encode({ id = id, method = method, params = params or vim.empty_dict() }) .. "\n")
+  pipe:write(encode(id, host, method, params))
 
   local ok = vim.wait(timeout_ms, function()
     return M.pending[id].done

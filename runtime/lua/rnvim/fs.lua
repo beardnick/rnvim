@@ -1,21 +1,18 @@
--- Virtual filesystem: maps buffers under the local workspace prefix
--- (~/.rnvim/ws/<host>/<remote abs path>) onto agent fs.* calls.
+-- Virtual filesystem: buffers under ~/.rnvim/ws/<slug>/<remote abs path>
+-- map onto agent fs.* calls, routed to the owning workspace's host.
 
 local rpc = require("rnvim.rpc")
+local workspaces = require("rnvim.workspaces")
 
 local M = {}
-local cfg
 
---- Strip the workspace prefix, leaving the remote absolute path.
-local function to_remote(file)
-  local p = file
-  if vim.startswith(p, cfg.ws_root) then
-    p = p:sub(#cfg.ws_root + 1)
+local function buf_workspace(bufnr)
+  local file = vim.api.nvim_buf_get_name(bufnr)
+  local ws = workspaces.of_file(file)
+  if not ws then
+    error(("[rnvim] %s is under the workspace prefix but no workspace is connected for it — use :RnvimConnect"):format(file))
   end
-  if p == "" then
-    p = "/"
-  end
-  return p
+  return ws, file
 end
 
 local function set_text(bufnr, text)
@@ -31,9 +28,9 @@ local function set_text(bufnr, text)
   vim.bo[bufnr].fixendofline = eol
 end
 
-local function open_dir(bufnr, file, remote)
-  local res = rpc.request("fs.list", { path = remote })
-  local lines = { ("rnvim://%s%s"):format(cfg.host, remote), "" }
+local function open_dir(bufnr, file, ws, remote)
+  local res = rpc.request(ws.host, "fs.list", { path = remote })
+  local lines = { ("rnvim://%s%s"):format(ws.host, remote), "" }
   for _, e in ipairs(res.entries or {}) do
     lines[#lines + 1] = e.kind == "dir" and (e.name .. "/") or e.name
   end
@@ -60,35 +57,31 @@ local function open_dir(bufnr, file, remote)
 
   vim.keymap.set("n", "-", function()
     local parent = vim.fs.dirname(base)
-    if parent and vim.startswith(parent, cfg.ws_root) then
+    if parent and vim.startswith(parent, ws.ws_root) then
       vim.cmd.edit(vim.fn.fnameescape(parent))
     end
   end, { buffer = bufnr, desc = "rnvim: parent directory" })
 end
 
 local function read_buf(bufnr)
-  local file = vim.api.nvim_buf_get_name(bufnr)
-  local remote = to_remote(file)
+  local ws, file = buf_workspace(bufnr)
+  local remote = workspaces.remote_path(file, ws)
   vim.bo[bufnr].swapfile = false
 
-  local st = rpc.request("fs.stat", { path = remote })
+  local st = rpc.request(ws.host, "fs.stat", { path = remote })
   if st.kind == "dir" then
-    open_dir(bufnr, file, remote)
+    open_dir(bufnr, file, ws, remote)
     return
   end
 
   if st.kind == "missing" then
     vim.bo[bufnr].modified = false
-    vim.api.nvim_echo({ { ('"%s" [New File] (rnvim: %s)'):format(remote, cfg.host) } }, false, {})
+    vim.api.nvim_echo({ { ('"%s" [New File] (rnvim: %s)'):format(remote, ws.host) } }, false, {})
   else
-    local res = rpc.request("fs.read", { path = remote })
+    local res = rpc.request(ws.host, "fs.read", { path = remote })
     set_text(bufnr, vim.base64.decode(res.content_b64))
     vim.bo[bufnr].modified = false
-    vim.api.nvim_echo(
-      { { ('"%s" %dB (rnvim: %s)'):format(remote, res.size, cfg.host) } },
-      false,
-      {}
-    )
+    vim.api.nvim_echo({ { ('"%s" %dB (rnvim: %s)'):format(remote, res.size, ws.host) } }, false, {})
   end
 
   local ft = vim.filetype.match({ filename = remote, buf = bufnr })
@@ -98,27 +91,30 @@ local function read_buf(bufnr)
 end
 
 local function write_buf(bufnr)
-  local file = vim.api.nvim_buf_get_name(bufnr)
-  local remote = to_remote(file)
+  local ws, file = buf_workspace(bufnr)
+  local remote = workspaces.remote_path(file, ws)
   local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
   local text = table.concat(lines, "\n")
   if vim.bo[bufnr].endofline or vim.bo[bufnr].fixendofline then
     text = text .. "\n"
   end
 
-  local res = rpc.request("fs.write", { path = remote, content_b64 = vim.base64.encode(text) })
+  local res = rpc.request(ws.host, "fs.write", { path = remote, content_b64 = vim.base64.encode(text) })
   vim.bo[bufnr].modified = false
   vim.api.nvim_echo(
-    { { ('"%s" %dL, %dB written (rnvim: %s)'):format(remote, #lines, res.bytes, cfg.host) } },
+    { { ('"%s" %dL, %dB written (rnvim: %s)'):format(remote, #lines, res.bytes, ws.host) } },
     false,
     {}
   )
 end
 
-function M.setup(opts)
-  cfg = opts
+function M.setup()
+  local base = workspaces.base()
+  if base == "" then
+    return
+  end
   local group = vim.api.nvim_create_augroup("RnvimFs", { clear = true })
-  local patterns = { cfg.ws_root, cfg.ws_root .. "/*" }
+  local patterns = { base .. "/*" }
 
   vim.api.nvim_create_autocmd("BufReadCmd", {
     group = group,
