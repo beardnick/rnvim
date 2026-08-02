@@ -749,7 +749,7 @@ dependencies = [
 
 [[package]]
 name = "rnvim"
-version = "0.9.1"
+version = "0.9.2"
 dependencies = [
  "anyhow",
  "base64",
@@ -768,7 +768,7 @@ dependencies = [
 
 [[package]]
 name = "rnvim-agent"
-version = "0.9.1"
+version = "0.9.2"
 dependencies = [
  "anyhow",
  "base64",
@@ -785,7 +785,7 @@ dependencies = [
 
 [[package]]
 name = "rnvim-proto"
-version = "0.9.1"
+version = "0.9.2"
 dependencies = [
  "serde",
  "serde_json",

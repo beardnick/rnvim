@@ -133,6 +133,22 @@ function M.register_workspace(ws)
     local cfg_name = ("%s_%s"):format(name, suffix)
     names[#names + 1] = cfg_name
 
+    -- Anything the user registered under the STANDARD server name — via
+    -- vim.lsp.config("gopls", { settings = ... }) or an lsp/gopls.lua on
+    -- their rtp — flows into the proxied variant: settings, handlers,
+    -- init_options... cmd/root_dir/capabilities stay rnvim's.
+    local ok_base, user_base = pcall(function()
+      return vim.lsp.config[name]
+    end)
+    if ok_base and type(user_base) == "table" then
+      local inherit = vim.deepcopy(user_base)
+      inherit.cmd = nil
+      inherit.root_dir = nil
+      inherit.root_markers = nil
+      inherit.filetypes = nil
+      vim.lsp.config(cfg_name, inherit)
+    end
+
     vim.lsp.config(cfg_name, {
       cmd = proxy_cmd,
       filetypes = def.filetypes,
