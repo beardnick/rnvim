@@ -1,6 +1,7 @@
 mod deploy;
 mod lsp_proxy;
 mod nvim;
+mod remotes;
 mod runtime;
 mod session;
 mod target;
@@ -67,11 +68,23 @@ fn main() -> Result<()> {
             std::process::exit(code);
         }
         None => {
-            let code = match cli.target {
-                Some(t) => session::run_remote(&t, &cli.headless_cmd)?,
-                None => session::run_local_editor(&cli.headless_cmd)?,
-            };
-            std::process::exit(code);
+            let interactive = cli.headless_cmd.is_empty();
+            let mut target = cli.target;
+            if target.is_none() && interactive {
+                target = remotes::select_target()?;
+            }
+            // Sessions chain: the in-editor connect picker hands the next
+            // target back, and we reopen straight into it.
+            loop {
+                let outcome = match &target {
+                    Some(t) => session::run_remote(t, &cli.headless_cmd)?,
+                    None => session::run_local_editor(&cli.headless_cmd)?,
+                };
+                match outcome.next_target {
+                    Some(next) if interactive => target = Some(next),
+                    _ => std::process::exit(outcome.code),
+                }
+            }
         }
     }
 }

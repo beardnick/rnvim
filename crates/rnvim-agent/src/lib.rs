@@ -3,6 +3,8 @@
 //! Runs on the remote machine (spawned via `ssh host rnvim agent --stdio`).
 //! Also used verbatim for `rnvim local:` loopback sessions and tests.
 
+mod finder;
+
 use std::fs;
 use std::io::{self, BufRead, Write};
 use std::path::{Component, Path, PathBuf};
@@ -50,6 +52,8 @@ fn dispatch(method: &str, params: Value) -> Result<Value> {
         "fs.list" => fs_list(serde_json::from_value(params)?),
         "fs.findroot" => fs_findroot(serde_json::from_value(params)?),
         "exec.which" => exec_which(serde_json::from_value(params)?),
+        "find.files" => finder::find_files(serde_json::from_value(params)?),
+        "find.grep" => finder::find_grep(serde_json::from_value(params)?),
         other => Err(anyhow!("unknown method: {other}")),
     }
 }
@@ -62,7 +66,7 @@ fn home_dir() -> PathBuf {
 
 /// Expand `~` and make relative paths home-relative (ssh convention), then
 /// normalize `.` and `..` lexically. Never touches the filesystem.
-fn expand(path: &str) -> PathBuf {
+pub(crate) fn expand(path: &str) -> PathBuf {
     let path = if path.is_empty() { "~" } else { path };
     let expanded = if path == "~" {
         home_dir()

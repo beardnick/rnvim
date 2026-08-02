@@ -76,7 +76,15 @@ scheme），为后续 LSP 代理的 URI 重写做的先手设计——翻译退�
   - `:RnvimTerm`：远程终端，cd 到当前 buffer 所在目录
   - 已知限制：字符串中段内嵌的路径不重写（只处理路径边界开头的值）；未处理百分号编码 URI；
     文件监听暂禁用（随 QUIC 里程碑做远程 watcher）
-- **M3**：finder/grep（nucleo + ignore，远程算匹配回传 top-N）、quickfix 集成
+- [x] **M3**：工作区导航
+  - `<C-p>` / `:RnvimFiles`：模糊文件跳转——文件遍历（ignore，尊重 .gitignore）和模糊打分
+    （nucleo）全在远程 agent 完成，每次按键只回传 top-N，大仓库不受文件数影响
+  - `<C-g>` / `:RnvimGrep`：实时 grep（ripgrep 引擎按库使用，smart-case，非法正则自动回退
+    字面量搜索），`<C-q>` 全部结果进 quickfix
+  - `:RnvimConnect` + `rnvim` 裸命令选择器：远程目标管理——解析 `~/.ssh/config`（含
+    Include）出 host 列表，`~/.rnvim/recent.json` 记住最近工作区（host + 目录，去重上限
+    50）；编辑器内选中目标即无缝切换会话（handoff + 客户端外层循环）
+  - agent 文件列表带 10s 缓存；20 万文件硬上限防止病态目录拖垮 agent
 - **M4**：QUIC 传输（0-RTT 重连、漫游）+ SSH stdio 降级、端口转发、git 只读三件套
 - [x] 发布工程：CI（fmt/clippy/test）+ tag 触发四平台构建（含 musl 静态 agent）发布到
   GitHub Release；客户端按需拉取远程平台的预编译 agent（本地经 `gh` 认证下载、缓存于

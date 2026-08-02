@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Bumped on any incompatible protocol change. Client and agent must match.
-pub const PROTO_VERSION: u32 = 2;
+pub const PROTO_VERSION: u32 = 3;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Request {
@@ -152,4 +152,40 @@ pub struct WhichParams {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct WhichResult {
     pub path: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct FindFilesParams {
+    pub root: String,
+    pub query: String,
+    pub limit: Option<u64>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct FindFilesResult {
+    /// Paths relative to `root`, best matches first.
+    pub files: Vec<String>,
+    /// Total files under root (after ignore rules), for "N of M" display.
+    pub total: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GrepParams {
+    pub root: String,
+    pub query: String,
+    pub limit: Option<u64>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GrepMatch {
+    pub path: String,
+    pub line: u64,
+    pub col: u64,
+    pub text: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GrepResult {
+    pub matches: Vec<GrepMatch>,
+    pub truncated: bool,
 }

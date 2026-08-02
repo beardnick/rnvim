@@ -22,8 +22,17 @@ local function on_data(data)
     if line ~= "" then
       local ok, msg = pcall(vim.json.decode, line)
       if ok and type(msg) == "table" and msg.id and M.pending[msg.id] then
-        M.pending[msg.id].msg = msg
-        M.pending[msg.id].done = true
+        local entry = M.pending[msg.id]
+        if entry.cb then
+          M.pending[msg.id] = nil
+          vim.schedule(function()
+            local err = msg.error and (msg.error.message or "remote error") or nil
+            entry.cb(err, msg.result)
+          end)
+        else
+          entry.msg = msg
+          entry.done = true
+        end
       end
     end
   end
@@ -48,6 +57,15 @@ function M.connect(path)
     end
     on_data(data)
   end)
+end
+
+--- Fire-and-callback request; `cb(err, result)` runs on the main loop.
+--- Never blocks — this is what interactive UIs (picker) must use.
+function M.request_async(method, params, cb)
+  local id = M.next_id
+  M.next_id = id + 1
+  M.pending[id] = { cb = cb }
+  pipe:write(vim.json.encode({ id = id, method = method, params = params or vim.empty_dict() }) .. "\n")
 end
 
 --- Send a request and wait for its response. Errors on timeout or remote error.

@@ -8,6 +8,11 @@ rnvim-proto.workspace = true
 anyhow.workspace = true
 serde_json.workspace = true
 base64.workspace = true
+ignore = "0.4"
+nucleo-matcher = "0.3"
+grep-searcher = "0.1"
+grep-regex = "0.1"
+grep-matcher = "0.1"
 
 [dev-dependencies]
 tempfile.workspace = true
