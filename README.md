@@ -23,7 +23,9 @@ agent、在本地打开远程工作区。buffer 在本地，打字零延迟；�
 
 - [x] 托管 Neovim：首次运行自动下载锁定版本，`NVIM_APPNAME=rnvim` 隔离启动
 - [x] 内嵌 Lua runtime，随二进制发布，启动时展开
-- [x] SSH 自动部署 agent：同平台推送自身二进制，跨平台回退到内嵌的纯 stdlib Python agent
+- [x] SSH 自动部署 agent：同平台推送自身二进制，跨平台从当前版本的 GitHub Release
+  拉取 musl 静态构建推送（本地缓存于 `~/.rnvim/dist/`；因此跨平台部署要求该版本
+  release 已发布——release train 纪律的一部分）
 - [x] 协议握手 + 版本校验（JSON-lines over stdio）
 - [x] 远程文件打开 / 编辑 / 保存（BufReadCmd/BufWriteCmd → agent fs 服务）
 - [x] 远程目录浏览（`<CR>` 进入，`-` 返回上级）

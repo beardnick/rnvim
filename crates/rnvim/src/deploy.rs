@@ -5,7 +5,10 @@
 //! 2. prebuilt agent for the remote target, fetched from this version's
 //!    GitHub release into ~/.rnvim/dist/ (authenticated locally via `gh`;
 //!    the remote never needs GitHub access) → push it
-//! 3. the embedded portable python agent (works everywhere python3 exists)
+//!
+//! Cross-platform deploys therefore require this version's release to be
+//! published (release-train discipline); same-platform pushes and `local:`
+//! loopback sessions never need one.
 //!
 //! Artifacts are version-stamped filenames under ~/.rnvim/bin on the remote,
 //! so a pure existence check is enough — client and agent can never skew.
@@ -16,25 +19,15 @@ use std::process::{Command, Stdio};
 
 use anyhow::{bail, Context, Result};
 
-const PY_AGENT: &str = include_str!("py_agent.py");
 const REPO: &str = "beardnick/rnvim";
 
 struct Probe {
     uname: String, // e.g. "Linux x86_64" / "Darwin arm64"
     have_bin: bool,
-    have_py: bool,
-    have_python3: bool,
 }
 
 fn bin_path() -> String {
     format!("$HOME/.rnvim/bin/rnvim-agent-{}", env!("CARGO_PKG_VERSION"))
-}
-
-fn py_path() -> String {
-    format!(
-        "$HOME/.rnvim/bin/rnvim-agent-{}.py",
-        env!("CARGO_PKG_VERSION")
-    )
 }
 
 fn ssh_run(host: &str, script: &str, stdin_data: Option<&[u8]>) -> Result<String> {
@@ -70,12 +63,8 @@ fn ssh_run(host: &str, script: &str, stdin_data: Option<&[u8]>) -> Result<String
 
 fn probe(host: &str) -> Result<Probe> {
     let script = format!(
-        "uname -sm; \
-         test -x {bin} && echo bin=yes || echo bin=no; \
-         test -f {py} && echo py=yes || echo py=no; \
-         command -v python3 >/dev/null 2>&1 && echo python3=yes || echo python3=no",
+        "uname -sm; test -x {bin} && echo bin=yes || echo bin=no",
         bin = bin_path(),
-        py = py_path(),
     );
     let out = ssh_run(host, &script, None)?;
     let mut lines = out.lines();
@@ -87,8 +76,6 @@ fn probe(host: &str) -> Result<Probe> {
     Ok(Probe {
         uname,
         have_bin: rest.contains(&"bin=yes"),
-        have_py: rest.contains(&"py=yes"),
-        have_python3: rest.contains(&"python3=yes"),
     })
 }
 
@@ -201,40 +188,25 @@ pub fn ensure_remote_agent(host: &str) -> Result<String> {
     }
 
     // 2. Prebuilt agent from this version's release.
-    if let Some(target) = remote_target(&p.uname) {
-        match fetch_agent_dist(target) {
-            Ok(dist) => {
-                eprintln!("[rnvim] deploying prebuilt agent ({target}) to {host}...");
-                let data =
-                    std::fs::read(&dist).with_context(|| format!("read {}", dist.display()))?;
-                push_agent_binary(host, &data)?;
-                return Ok(bin_cmd);
-            }
-            Err(e) => eprintln!("[rnvim] {e}; falling back to portable python agent"),
-        }
-    }
-
-    // 3. Portable python agent.
-    if !p.have_python3 {
+    let Some(target) = remote_target(&p.uname) else {
         bail!(
-            "remote {host} is {} (local is {}), no prebuilt agent available, \
-             and no python3 on the remote — cannot deploy an agent",
-            p.uname,
-            local_uname_sm()
-        );
-    }
-    if !p.have_py {
-        eprintln!(
-            "[rnvim] deploying portable agent to {host} ({})...",
+            "remote {host} is {} — no agent build exists for this platform \
+             (supported: Linux/macOS on x86_64/aarch64)",
             p.uname
         );
-        let script = format!(
-            "mkdir -p $HOME/.rnvim/bin && cat > {py}.tmp && mv {py}.tmp {py}",
-            py = py_path()
-        );
-        ssh_run(host, &script, Some(PY_AGENT.as_bytes()))?;
-    }
-    Ok(format!("python3 {}", py_path()))
+    };
+    let dist = fetch_agent_dist(target).with_context(|| {
+        format!(
+            "no agent available for {host} ({}): the v{} release must be published \
+             for cross-platform deploys",
+            p.uname,
+            env!("CARGO_PKG_VERSION")
+        )
+    })?;
+    eprintln!("[rnvim] deploying prebuilt agent ({target}) to {host}...");
+    let data = std::fs::read(&dist).with_context(|| format!("read {}", dist.display()))?;
+    push_agent_binary(host, &data)?;
+    Ok(bin_cmd)
 }
 
 #[cfg(test)]
