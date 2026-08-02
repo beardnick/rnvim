@@ -6,6 +6,7 @@
 mod finder;
 
 mod exec;
+pub mod http;
 pub use exec::TOOLS_PATH;
 
 use std::fs;
@@ -39,7 +40,7 @@ pub fn run_stdio() -> Result<()> {
         // Installs download for minutes; never block the request loop.
         // Responses are id-matched, so out-of-order delivery is fine.
         if let Ok(req) = serde_json::from_str::<Request>(&line) {
-            if req.method == "exec.run" {
+            if req.method == "exec.run" || req.method == "fetch.url" {
                 let stdout = Arc::clone(&stdout);
                 std::thread::spawn(move || {
                     let resp = match dispatch(&req.method, req.params) {
@@ -74,10 +75,12 @@ fn dispatch(method: &str, params: Value) -> Result<Value> {
         "fs.stat" => fs_stat(serde_json::from_value(params)?),
         "fs.read" => fs_read(serde_json::from_value(params)?),
         "fs.write" => fs_write(serde_json::from_value(params)?),
+        "fs.append" => fs_append(serde_json::from_value(params)?),
         "fs.list" => fs_list(serde_json::from_value(params)?),
         "fs.findroot" => fs_findroot(serde_json::from_value(params)?),
         "exec.which" => exec_which(serde_json::from_value(params)?),
         "exec.run" => exec_run(serde_json::from_value(params)?),
+        "fetch.url" => fetch_url(params),
         "find.files" => finder::find_files(serde_json::from_value(params)?),
         "find.grep" => finder::find_grep(serde_json::from_value(params)?),
         other => Err(anyhow!("unknown method: {other}")),
@@ -186,6 +189,26 @@ fn fs_write(p: WriteParams) -> Result<Value> {
     }))
 }
 
+fn fs_append(p: AppendParams) -> Result<Value> {
+    let path = expand(&p.path);
+    let data = B64
+        .decode(p.content_b64.as_bytes())
+        .context("decode content")?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    use std::io::Write as _;
+    let mut f = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("append {}", path.display()))?;
+    f.write_all(&data)?;
+    Ok(json!(WriteResult {
+        bytes: data.len() as u64
+    }))
+}
+
 fn fs_list(p: ListParams) -> Result<Value> {
     let path = expand(&p.path);
     let mut entries = Vec::new();
@@ -257,6 +280,22 @@ fn exec_which(p: WhichParams) -> Result<Value> {
         None
     };
     Ok(json!(WhichResult { path }))
+}
+
+/// Native HTTP download to a path on this host (see http.rs). Dispatched
+/// on its own thread by run_stdio — downloads can take minutes.
+fn fetch_url(params: Value) -> Result<Value> {
+    let url = params
+        .get("url")
+        .and_then(Value::as_str)
+        .context("missing url")?;
+    let path = params
+        .get("path")
+        .and_then(Value::as_str)
+        .context("missing path")?;
+    let dest = expand(path);
+    let bytes = http::download(url, &dest)?;
+    Ok(json!(WriteResult { bytes }))
 }
 
 /// Run a client-supplied script (see exec.rs). Dispatched on its own

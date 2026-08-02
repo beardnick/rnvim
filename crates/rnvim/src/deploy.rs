@@ -138,17 +138,9 @@ fn fetch_agent_dist(target: &str) -> Result<PathBuf> {
         .unwrap_or(false);
     if !gh_ok {
         let url = format!("https://github.com/{REPO}/releases/download/{tag}/{asset}");
-        let curl_ok = Command::new("curl")
-            .args(["-fsSL", "-o"])
-            .arg(&path)
-            .arg(&url)
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if !curl_ok {
-            let _ = std::fs::remove_file(&path);
-            bail!("no prebuilt agent {asset} for release {tag} (gh and curl both failed)");
-        }
+        rnvim_agent::http::download(&url, &path).with_context(|| {
+            format!("no prebuilt agent {asset} for release {tag} (gh failed, direct fetch failed)")
+        })?;
     }
     if !path.exists() {
         bail!(

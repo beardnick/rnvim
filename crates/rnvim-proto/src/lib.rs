@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Bumped on any incompatible protocol change. Client and agent must match.
-pub const PROTO_VERSION: u32 = 4;
+pub const PROTO_VERSION: u32 = 5;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Request {
@@ -114,6 +114,14 @@ pub struct WriteParams {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct WriteResult {
     pub bytes: u64,
+}
+
+/// Append a chunk to a file (large artifact staging: the client downloads
+/// locally and streams bytes through the agent in chunks).
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AppendParams {
+    pub path: String,
+    pub content_b64: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

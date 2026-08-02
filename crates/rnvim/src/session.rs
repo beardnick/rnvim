@@ -156,6 +156,16 @@ impl Router {
 
     /// Blocking request from the broker itself to an agent.
     fn agent_request(&self, agent: &Agent, method: &str, params: Value) -> Result<Value> {
+        self.agent_request_timeout(agent, method, params, Duration::from_secs(120))
+    }
+
+    fn agent_request_timeout(
+        &self,
+        agent: &Agent,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Value> {
         let id = self.next_internal_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = mpsc::channel();
         self.pending.lock().unwrap().insert(id, tx);
@@ -170,7 +180,7 @@ impl Router {
             stdin.write_all(line.as_bytes()).context("write to agent")?;
             stdin.flush()?;
         }
-        let resp = rx.recv_timeout(Duration::from_secs(120)).map_err(|_| {
+        let resp = rx.recv_timeout(timeout).map_err(|_| {
             self.pending.lock().unwrap().remove(&id);
             anyhow!("{method} timed out (agent unresponsive)")
         })?;
@@ -263,6 +273,58 @@ impl Router {
         Ok(json!({ "abs": resolved.abs, "entries": listing.get("entries") }))
     }
 
+    /// Install a tool on `host`. Downloads happen on the remote through
+    /// the agent's native HTTP client (fetch.url — no curl involved), then
+    /// a local unpack script links the binary. npm/golang plans use the
+    /// remote package manager, which follows the remote's own mirrors.
+    fn install_on(self: &Arc<Self>, host: &str, name: &str) -> Result<Value> {
+        let agent = self.ensure_agent(&Target::parse(host))?;
+        let uname = self.agent_request(&agent, "exec.run", json!({ "script": "uname -sm" }))?;
+        let uname_sm = uname
+            .get("stdout")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .context("could not detect remote platform")?
+            .to_string();
+
+        let script = match crate::registry::plan_for(name, &uname_sm)? {
+            crate::registry::InstallPlan::Remote { script } => script,
+            crate::registry::InstallPlan::Staged { url, file, script } => {
+                self.agent_request_timeout(
+                    &agent,
+                    "fetch.url",
+                    json!({ "url": url, "path": format!("~/.rnvim/stage/{file}") }),
+                    Duration::from_secs(20 * 60),
+                )
+                .with_context(|| format!("remote download of {url}"))?;
+                script
+            }
+        };
+
+        let out = self.agent_request_timeout(
+            &agent,
+            "exec.run",
+            json!({ "script": script }),
+            Duration::from_secs(20 * 60),
+        )?;
+        let code = out.get("code").and_then(Value::as_i64).unwrap_or(-1);
+        if code != 0 {
+            let stderr = out.get("stderr").and_then(Value::as_str).unwrap_or("");
+            bail!(
+                "install script failed: {}",
+                stderr.lines().last().unwrap_or("unknown error").trim()
+            );
+        }
+        let path = out
+            .get("stdout")
+            .and_then(Value::as_str)
+            .and_then(|s| s.lines().rev().map(str::trim).find(|l| !l.is_empty()))
+            .unwrap_or("?")
+            .to_string();
+        Ok(json!({ "path": path }))
+    }
+
     fn handle_session_method(
         self: &Arc<Self>,
         conn_id: u64,
@@ -308,6 +370,10 @@ impl Router {
                         }
                     }
                     None => Err(anyhow!("missing id")),
+                },
+                "session.install" => match (param("host"), param("name")) {
+                    (Some(h), Some(n)) => router.install_on(&h, &n),
+                    _ => Err(anyhow!("missing host/name")),
                 },
                 "session.rooted" => match (param("host"), param("path")) {
                     (Some(h), Some(p)) => {

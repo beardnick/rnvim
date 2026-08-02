@@ -81,16 +81,7 @@ pub fn ensure_nvim() -> Result<PathBuf> {
     let tarball = tmp_dir.join(format!("{asset}.tar.gz"));
     let url =
         format!("https://github.com/neovim/neovim/releases/download/{NVIM_VERSION}/{asset}.tar.gz");
-
-    let status = Command::new("curl")
-        .args(["-fL", "--progress-bar", "-o"])
-        .arg(&tarball)
-        .arg(&url)
-        .status()
-        .context("spawn curl (is curl installed?)")?;
-    if !status.success() {
-        bail!("download failed: {url}");
-    }
+    rnvim_agent::http::download(&url, &tarball)?;
 
     std::fs::create_dir_all(&version_dir)?;
     let status = Command::new("tar")

@@ -32,15 +32,7 @@ pub fn update() -> Result<PathBuf> {
     std::fs::create_dir_all(&dir)?;
     let zip = dir.join("registry.json.zip");
     eprintln!("[rnvim] fetching mason registry...");
-    let status = Command::new("curl")
-        .args(["-fsSL", "-o"])
-        .arg(&zip)
-        .arg(REGISTRY_URL)
-        .status()
-        .context("spawn curl")?;
-    if !status.success() {
-        bail!("registry download failed: {REGISTRY_URL}");
-    }
+    rnvim_agent::http::download(REGISTRY_URL, &zip)?;
     let out = Command::new("unzip")
         .arg("-p")
         .arg(&zip)
@@ -209,7 +201,7 @@ fn github_script(pkg: &Value, purl: &Purl, requested: &str) -> Result<String> {
         };
         let bin_rel = bin
             .as_deref()
-            .map(|b| template(b, &purl.version))
+            .map(|b| template(b.strip_prefix("exec:").unwrap_or(b), &purl.version))
             .unwrap_or_else(|| local.clone());
         cases.push_str(&format!(
             "  \"{uname}\") file=\"{remote}\"; local=\"{local}\"; bin_rel=\"{bin_rel}\" ;;\n"
@@ -240,7 +232,8 @@ case "$local" in
 esac
 chmod +x "$pkg/$bin_rel" 2>/dev/null || true
 [ -x "$pkg/$bin_rel" ] || {{ echo "installed but $bin_rel not found/executable" >&2; exit 1; }}
-ln -sf "$pkg/$bin_rel" "$RNVIM_TOOLS_BIN/{key}"
+printf '#!/bin/sh\nexec "%s" "$@"\n' "$pkg/$bin_rel" > "$RNVIM_TOOLS_BIN/{key}"
+chmod +x "$RNVIM_TOOLS_BIN/{key}"
 echo "$RNVIM_TOOLS_BIN/{key}"
 "#,
         repo = purl.path,
@@ -274,6 +267,160 @@ echo "$RNVIM_TOOLS_BIN/{key}"
         module = purl.path,
         version = purl.version,
     ))
+}
+
+/// How a package gets onto a specific remote host.
+pub enum InstallPlan {
+    /// The agent downloads `url` natively (fetch.url — built-in HTTP
+    /// client, no curl) to ~/.rnvim/stage/<file> on the remote; `script`
+    /// then unpacks and links it.
+    Staged {
+        url: String,
+        file: String,
+        script: String,
+    },
+    /// Runs entirely on the remote (npm/golang: needs the remote package
+    /// manager anyway, which follows the remote's own mirror config).
+    Remote { script: String },
+}
+
+/// Resolve a package into an install plan for a concrete remote platform
+/// (`uname -sm` output). Used by the broker's session.install.
+pub fn plan_for(name: &str, uname_sm: &str) -> Result<InstallPlan> {
+    let packages = load()?;
+    let pkg = find(&packages, name)
+        .ok_or_else(|| anyhow!("{name}: not in the mason registry (try: rnvim registry update)"))?;
+    let id = pkg
+        .get("source")
+        .and_then(|s| s.get("id"))
+        .and_then(Value::as_str)
+        .context("package has no source id")?;
+    let purl = parse_purl(id)?;
+    match purl.kind.as_str() {
+        "github" => staged_github_plan(pkg, &purl, name, uname_sm),
+        "npm" => Ok(InstallPlan::Remote {
+            script: npm_script(pkg, &purl, name)?,
+        }),
+        "golang" => Ok(InstallPlan::Remote {
+            script: golang_script(pkg, &purl, name)?,
+        }),
+        other => bail!(
+            "{name} uses unsupported source type {other:?} — define it in vim.g.rnvim_lsp_recipes"
+        ),
+    }
+}
+
+/// Pick the release asset matching `uname_sm` and emit the network-free
+/// unpack script that expects the file staged at ~/.rnvim/stage/.
+fn staged_github_plan(
+    pkg: &Value,
+    purl: &Purl,
+    requested: &str,
+    uname_sm: &str,
+) -> Result<InstallPlan> {
+    let assets = pkg
+        .get("source")
+        .and_then(|s| s.get("asset"))
+        .context("github source without assets")?;
+    let asset_list: Vec<&Value> = match assets {
+        Value::Array(items) => items.iter().collect(),
+        one => vec![one],
+    };
+
+    let mut best: Option<(u8, String, Option<String>)> = None;
+    for asset in &asset_list {
+        let Some(file) = asset.get("file").and_then(Value::as_str) else {
+            continue;
+        };
+        let bin = asset.get("bin").and_then(Value::as_str).map(String::from);
+        let targets: Vec<&str> = match asset.get("target") {
+            Some(Value::String(t)) => vec![t.as_str()],
+            Some(Value::Array(ts)) => ts.iter().filter_map(Value::as_str).collect(),
+            _ => continue,
+        };
+        for t in targets {
+            if !target_unames(t).contains(&uname_sm) {
+                continue;
+            }
+            let prio = target_priority(t);
+            if best.as_ref().is_none_or(|(p, _, _)| prio > *p) {
+                best = Some((prio, file.to_string(), bin.clone()));
+            }
+        }
+    }
+    let (_, file, bin) =
+        best.ok_or_else(|| anyhow!("no release asset for platform {uname_sm:?}"))?;
+
+    let name = pkg.get("name").and_then(Value::as_str).unwrap_or(requested);
+    let key = bin_key(pkg, requested)?;
+    // mason file syntax: "remote", "remote:localname" (rename), or
+    // "remote:subdir/" (extract INTO that directory inside the package).
+    let (remote_file, stage_name, extract_sub) = match file.split_once(':') {
+        Some((r, sub)) if sub.ends_with('/') => {
+            let remote = template(r, &purl.version);
+            let base = remote.rsplit('/').next().unwrap_or(&remote).to_string();
+            (remote, base, sub.trim_end_matches('/').to_string())
+        }
+        Some((r, l)) if !l.is_empty() => (
+            template(r, &purl.version),
+            template(l, &purl.version),
+            String::new(),
+        ),
+        _ => {
+            let f = template(&file, &purl.version);
+            (f.clone(), f, String::new())
+        }
+    };
+    let bin_rel = bin
+        .as_deref()
+        .map(|b| template(b.strip_prefix("exec:").unwrap_or(b), &purl.version))
+        .unwrap_or_else(|| stage_name.clone());
+    let url = format!(
+        "https://github.com/{}/releases/download/{}/{}",
+        purl.path, purl.version, remote_file
+    );
+    let extract_dir = if extract_sub.is_empty() {
+        "$pkg".to_string()
+    } else {
+        format!("$pkg/{extract_sub}")
+    };
+
+    let script = format!(
+        r#"set -e
+staged="$HOME/.rnvim/stage/{stage_name}"
+[ -f "$staged" ] || {{ echo "staged file missing: $staged" >&2; exit 1; }}
+pkg="$RNVIM_TOOLS/{name}"
+rm -rf "$pkg" && mkdir -p "{extract_dir}"
+bin_rel="{bin_rel}"
+case "{stage_name}" in
+  *.tar.gz|*.tgz) tar xzf "$staged" -C "{extract_dir}" ;;
+  *.tar.xz)       tar xJf "$staged" -C "{extract_dir}" ;;
+  *.tar)          tar xf "$staged" -C "{extract_dir}" ;;
+  *.zip)
+    command -v unzip >/dev/null 2>&1 || {{ echo "unzip required on this host" >&2; exit 1; }}
+    unzip -oq "$staged" -d "{extract_dir}" ;;
+  *.gz)
+    bin_rel="{stage_stem}"
+    gunzip -c "$staged" > "$pkg/$bin_rel" ;;
+  *)
+    bin_rel="{stage_name}"
+    cp "$staged" "$pkg/$bin_rel" ;;
+esac
+rm -f "$staged"
+chmod +x "$pkg/$bin_rel" 2>/dev/null || true
+[ -x "$pkg/$bin_rel" ] || {{ echo "unpacked but $bin_rel not found/executable" >&2; exit 1; }}
+printf '#!/bin/sh\nexec "%s" "$@"\n' "$pkg/$bin_rel" > "$RNVIM_TOOLS_BIN/{key}"
+chmod +x "$RNVIM_TOOLS_BIN/{key}"
+echo "$RNVIM_TOOLS_BIN/{key}"
+"#,
+        stage_stem = stage_name.strip_suffix(".gz").unwrap_or(&stage_name),
+    );
+
+    Ok(InstallPlan::Staged {
+        url,
+        file: stage_name,
+        script,
+    })
 }
 
 pub fn script_for(name: &str) -> Result<String> {
@@ -355,6 +502,41 @@ mod tests {
         let purl = parse_purl("pkg:golang/golang.org/x/tools/gopls@v0.19.1").unwrap();
         let s = golang_script(&pkg, &purl, "gopls").unwrap();
         assert!(s.contains("go install \"golang.org/x/tools/gopls@v0.19.1\""));
+    }
+
+    #[test]
+    fn staged_plan_handles_mason_syntax() {
+        // ":subdir/" extracts into a subdirectory; "exec:" prefixes strip;
+        // launcher is a wrapper shim, never a symlink (argv0-relative tools)
+        let pkg = json!({
+            "name": "lls",
+            "bin": { "lls": "{{source.asset.bin}}" },
+            "source": {
+                "id": "pkg:github/acme/lls@3.0.0",
+                "asset": [{
+                    "target": "darwin_x64",
+                    "file": "lls-3.0.0-darwin-x64.tar.gz:libexec/",
+                    "bin": "exec:libexec/bin/lls"
+                }]
+            }
+        });
+        let purl = parse_purl("pkg:github/acme/lls@3.0.0").unwrap();
+        let plan = staged_github_plan(&pkg, &purl, "lls", "Darwin x86_64").unwrap();
+        let InstallPlan::Staged { url, file, script } = plan else {
+            panic!("expected staged plan");
+        };
+        assert!(url.ends_with("/download/3.0.0/lls-3.0.0-darwin-x64.tar.gz"));
+        assert_eq!(
+            file, "lls-3.0.0-darwin-x64.tar.gz",
+            "staged under the archive basename"
+        );
+        assert!(script.contains("$pkg/libexec"), "extracts into the subdir");
+        assert!(
+            script.contains("bin_rel=\"libexec/bin/lls\""),
+            "exec: stripped: {script}"
+        );
+        assert!(script.contains("exec \"%s\""), "wrapper shim, not symlink");
+        assert!(!script.contains("ln -sf"), "no symlinks");
     }
 
     #[test]
