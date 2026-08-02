@@ -105,6 +105,20 @@ function M.setup(opts)
   end
 
   vim.lsp.enable(vim.tbl_keys(servers))
+
+  -- Definition-jump keymaps nvim does not ship by default (gd is the old
+  -- "local declaration" motion). grr/gri/grn/gra/K/CTRL-] are built-ins.
+  vim.api.nvim_create_autocmd("LspAttach", {
+    group = vim.api.nvim_create_augroup("RnvimLspKeymaps", { clear = true }),
+    callback = function(ev)
+      local function map(lhs, fn, desc)
+        vim.keymap.set("n", lhs, fn, { buffer = ev.buf, desc = "rnvim: " .. desc })
+      end
+      map("gd", vim.lsp.buf.definition, "go to definition")
+      map("gD", vim.lsp.buf.declaration, "go to declaration")
+      map("gy", vim.lsp.buf.type_definition, "go to type definition")
+    end,
+  })
 end
 
 return M
