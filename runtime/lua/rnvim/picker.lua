@@ -217,6 +217,16 @@ local function accept()
   end
 
   if state.mode == "connect" then
+    if item.focus_id then
+      -- An already-open session: switch the daemon's focus to it.
+      close()
+      rpc.request_async(nil, "session.focus", { id = item.focus_id }, function(err)
+        if err then
+          vim.notify("[rnvim] switch failed: " .. err, vim.log.levels.ERROR)
+        end
+      end)
+      return
+    end
     local target = item.target
     if not target:find(":", 1, true) then
       -- Host without a path: enter the directory-selection stage before
@@ -342,6 +352,12 @@ local function connect_items()
     return {}
   end
   local items = {}
+  for _, s in ipairs(data.open or {}) do
+    items[#items + 1] = {
+      display = ("%s %s  [open]"):format(s.active and "●" or "○", s.title),
+      focus_id = s.id,
+    }
+  end
   for _, e in ipairs(data.recent or {}) do
     local target = ("%s:%s"):format(e.host, e.path)
     items[#items + 1] = { display = target, target = target }

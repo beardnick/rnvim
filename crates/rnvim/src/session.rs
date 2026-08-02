@@ -52,6 +52,7 @@ pub struct WorkspaceInfo {
 
 type ConnectHook = Box<dyn Fn(&str) -> Result<Value> + Send + Sync>;
 type RootedHook = Box<dyn Fn(&Value) + Send + Sync>;
+type FocusHook = Box<dyn Fn(u64) + Send + Sync>;
 
 pub struct Router {
     ws_base: PathBuf,
@@ -67,6 +68,8 @@ pub struct Router {
     connect_hook: Mutex<Option<ConnectHook>>,
     /// Extra observer for session.rooted (the daemon retitles the session).
     rooted_hook: Mutex<Option<RootedHook>>,
+    /// Daemon override for session.focus (switch to an open instance).
+    focus_hook: Mutex<Option<FocusHook>>,
 }
 
 impl Router {
@@ -82,6 +85,7 @@ impl Router {
             next_fwd_id: AtomicU64::new(FWD_ID_BASE),
             connect_hook: Mutex::new(None),
             rooted_hook: Mutex::new(None),
+            focus_hook: Mutex::new(None),
         })
     }
 
@@ -91,6 +95,10 @@ impl Router {
 
     pub fn set_rooted_hook(&self, hook: RootedHook) {
         *self.rooted_hook.lock().unwrap() = Some(hook);
+    }
+
+    pub fn set_focus_hook(&self, hook: FocusHook) {
+        *self.focus_hook.lock().unwrap() = Some(hook);
     }
 
     fn write_conn(&self, conn_id: u64, line: &str) {
@@ -289,6 +297,17 @@ impl Router {
                 "session.browse" => match (param("host"), param("path")) {
                     (Some(h), Some(p)) => router.browse(&h, &p),
                     _ => Err(anyhow!("missing host/path")),
+                },
+                "session.focus" => match params.get("id").and_then(Value::as_u64) {
+                    Some(id) => {
+                        if let Some(hook) = router.focus_hook.lock().unwrap().as_ref() {
+                            hook(id);
+                            Ok(json!({ "ok": true }))
+                        } else {
+                            Err(anyhow!("session.focus unavailable outside the daemon"))
+                        }
+                    }
+                    None => Err(anyhow!("missing id")),
                 },
                 "session.rooted" => match (param("host"), param("path")) {
                     (Some(h), Some(p)) => {

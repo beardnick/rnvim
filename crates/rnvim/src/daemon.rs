@@ -65,6 +65,11 @@ struct Session {
     applied_size: Mutex<(u16, u16)>,
 }
 
+/// Width of the session sidebar (including the separator column).
+const SIDEBAR_WIDTH: u16 = 26;
+/// Below this total width the sidebar auto-hides.
+const SIDEBAR_MIN_COLS: u16 = SIDEBAR_WIDTH + 40;
+
 fn push_color(sgr: &mut String, color: vt100::Color, fg: bool) {
     use std::fmt::Write;
     match color {
@@ -86,13 +91,39 @@ fn push_color(sgr: &mut String, color: vt100::Color, fg: bool) {
 /// leans on and which weaker embedded terminals don't implement (blank
 /// regions rendered as default background). Wrapped in synchronized
 /// output so capable terminals apply the frame atomically.
+#[cfg_attr(not(test), allow(dead_code))] // exercised by the rendering tests
 fn full_frame(screen: &vt100::Screen) -> Vec<u8> {
-    let (rows, cols) = screen.size();
     let mut out: Vec<u8> = b"\x1b[?2026h\x1b[2J".to_vec();
+    render_grid(&mut out, screen, 0);
+    finish_frame(&mut out, screen, 0);
+    out
+}
+
+fn finish_frame(out: &mut Vec<u8>, screen: &vt100::Screen, col_offset: u16) {
+    let (cursor_row, cursor_col) = screen.cursor_position();
+    out.extend_from_slice(
+        format!(
+            "\x1b[m\x1b[{};{}H",
+            cursor_row + 1,
+            cursor_col + 1 + col_offset
+        )
+        .as_bytes(),
+    );
+    out.extend_from_slice(if screen.hide_cursor() {
+        b"\x1b[?25l"
+    } else {
+        b"\x1b[?25h"
+    });
+    out.extend_from_slice(b"\x1b[?2026l");
+}
+
+/// Paint the whole grid, every cell explicit, shifted right by col_offset.
+fn render_grid(out: &mut Vec<u8>, screen: &vt100::Screen, col_offset: u16) {
+    let (rows, cols) = screen.size();
     let mut current_sgr = String::new();
 
     for row in 0..rows {
-        out.extend_from_slice(format!("\x1b[{};1H", row + 1).as_bytes());
+        out.extend_from_slice(format!("\x1b[{};{}H", row + 1, col_offset + 1).as_bytes());
         let mut col = 0;
         while col < cols {
             let Some(cell) = screen.cell(row, col) else {
@@ -127,16 +158,105 @@ fn full_frame(screen: &vt100::Screen) -> Vec<u8> {
             col += if cell.is_wide() { 2 } else { 1 };
         }
     }
+}
 
-    let (cursor_row, cursor_col) = screen.cursor_position();
-    out.extend_from_slice(format!("\x1b[m\x1b[{};{}H", cursor_row + 1, cursor_col + 1).as_bytes());
-    out.extend_from_slice(if screen.hide_cursor() {
-        b"\x1b[?25l"
-    } else {
-        b"\x1b[?25h"
-    });
-    out.extend_from_slice(b"\x1b[?2026l");
-    out
+/// Paint the session sidebar into columns 1..=SIDEBAR_WIDTH: header, one
+/// row per session (active inverted), separator column, every cell
+/// explicit per the weakest-terminal rule.
+fn render_sidebar(out: &mut Vec<u8>, items: &[(String, bool)], rows: u16) {
+    let text_w = (SIDEBAR_WIDTH - 1) as usize;
+    for row in 1..=rows {
+        out.extend_from_slice(format!("\x1b[{row};1H").as_bytes());
+        let (label, active) = match row {
+            1 => (" SESSIONS".to_string(), false),
+            r if (r as usize) >= 2 && (r as usize) - 2 < items.len() => {
+                let idx = (r as usize) - 2;
+                let (title, active) = &items[idx];
+                let mut label = format!(" {} {}", idx + 1, title);
+                if label.chars().count() > text_w {
+                    let tail: String = label
+                        .chars()
+                        .rev()
+                        .take(text_w - 2)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect();
+                    label = format!(" \u{2026}{tail}");
+                }
+                (label, *active)
+            }
+            _ => (String::new(), false),
+        };
+        if row == 1 {
+            out.extend_from_slice(b"\x1b[0;1;38;5;245;48;5;236m");
+        } else if active {
+            out.extend_from_slice(b"\x1b[0;7m");
+        } else {
+            out.extend_from_slice(b"\x1b[0;38;5;250;48;5;236m");
+        }
+        let mut printed = 0usize;
+        for ch in label.chars().take(text_w) {
+            let mut buf = [0u8; 4];
+            out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+            printed += 1;
+        }
+        for _ in printed..text_w {
+            out.push(b' ');
+        }
+        out.extend_from_slice("\x1b[0;38;5;240m\u{2502}".as_bytes());
+    }
+}
+
+/// Rewrite SGR mouse coordinates for the sidebar offset. Returns the bytes
+/// to forward to nvim plus any left-button presses that landed inside the
+/// sidebar (row-indexed, for session switching).
+fn translate_sgr_mouse(data: &[u8], sidebar_w: u16) -> (Vec<u8>, Vec<u32>) {
+    let mut out = Vec::with_capacity(data.len());
+    let mut clicks = Vec::new();
+    let mut i = 0;
+    while i < data.len() {
+        let looks_like_mouse =
+            data[i] == 0x1b && i + 2 < data.len() && data[i + 1] == b'[' && data[i + 2] == b'<';
+        if looks_like_mouse {
+            if let Some(end) = data[i + 3..]
+                .iter()
+                .position(|&b| b == b'M' || b == b'm')
+                .map(|off| i + 3 + off)
+            {
+                let body = &data[i + 3..end];
+                let parts: Vec<u32> = body
+                    .split(|&b| b == b';')
+                    .filter_map(|f| std::str::from_utf8(f).ok()?.parse().ok())
+                    .collect();
+                if parts.len() == 3 {
+                    let (btn, x, y) = (parts[0], parts[1], parts[2]);
+                    if x <= sidebar_w as u32 {
+                        if data[end] == b'M' && btn == 0 {
+                            clicks.push(y);
+                        }
+                        // swallow sidebar-area mouse events entirely
+                    } else {
+                        out.extend_from_slice(
+                            format!(
+                                "\x1b[<{};{};{}{}",
+                                btn,
+                                x - sidebar_w as u32,
+                                y,
+                                data[end] as char
+                            )
+                            .as_bytes(),
+                        );
+                    }
+                    i = end + 1;
+                    continue;
+                }
+            }
+        }
+        out.push(data[i]);
+        i += 1;
+    }
+    (out, clicks)
 }
 
 /// Channel to the attached client. Control messages queue (they are tiny
@@ -155,6 +275,8 @@ struct Daemon {
     active: AtomicU64,
     next_id: AtomicU64,
     client: Mutex<Option<ClientTx>>,
+    /// Session sidebar visibility (toggled with the prefix key).
+    sidebar: std::sync::atomic::AtomicBool,
     size: Mutex<PtySize>,
     router_socket: std::path::PathBuf,
     targets_file: Option<std::path::PathBuf>,
@@ -245,6 +367,68 @@ impl Daemon {
         json!({ "t": "sessions", "items": items })
     }
 
+    fn sidebar_visible(&self, total: PtySize) -> bool {
+        self.sidebar.load(Ordering::SeqCst) && total.cols >= SIDEBAR_MIN_COLS
+    }
+
+    /// The size the nvim PTYs actually get (total minus sidebar).
+    fn inner_size(&self, total: PtySize) -> PtySize {
+        if self.sidebar_visible(total) {
+            PtySize {
+                cols: total.cols - SIDEBAR_WIDTH,
+                ..total
+            }
+        } else {
+            total
+        }
+    }
+
+    fn sidebar_items(&self) -> Vec<(String, bool)> {
+        let active = self.active.load(Ordering::SeqCst);
+        self.sessions
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|s| (s.title.lock().unwrap().clone(), s.id == active))
+            .collect()
+    }
+
+    /// Keep the picker candidate file in sync with live sessions.
+    fn update_targets(&self) {
+        if let Some(path) = &self.targets_file {
+            let active = self.active.load(Ordering::SeqCst);
+            let open: Vec<remotes::OpenSession> = self
+                .sessions
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|s| remotes::OpenSession {
+                    id: s.id,
+                    title: s.title.lock().unwrap().clone(),
+                    active: s.id == active,
+                })
+                .collect();
+            let _ = remotes::rewrite_targets_file(path, &open);
+        }
+    }
+
+    /// Compose the client-facing frame: sidebar (when visible) + the
+    /// session grid shifted right, cursor adjusted to match.
+    fn compose_frame(&self, session: &Session) -> Vec<u8> {
+        let total = *self.size.lock().unwrap();
+        let screen = session.parser.lock().unwrap().screen().clone();
+        let mut out: Vec<u8> = b"\x1b[?2026h\x1b[2J".to_vec();
+        let offset = if self.sidebar_visible(total) {
+            render_sidebar(&mut out, &self.sidebar_items(), total.rows);
+            SIDEBAR_WIDTH
+        } else {
+            0
+        };
+        render_grid(&mut out, &screen, offset);
+        finish_frame(&mut out, &screen, offset);
+        out
+    }
+
     fn status(&self, msg: &str) {
         eprintln!("[rnvim] {msg}");
         self.send_client(&json!({ "t": "status", "msg": msg }));
@@ -253,7 +437,7 @@ impl Daemon {
     /// Paint the session's full screen to the client from the daemon's own
     /// virtual-screen state. Purely local — needs nothing from nvim.
     fn repaint(&self, session: &Session) {
-        let frame = full_frame(session.parser.lock().unwrap().screen());
+        let frame = self.compose_frame(session);
         *session.last_frame.lock().unwrap() = Some(frame.clone());
         self.send_client(&json!({ "t": "output", "b64": B64.encode(&frame) }));
     }
@@ -288,6 +472,14 @@ impl Daemon {
         }));
         self.apply_size(&session);
         self.repaint(&session);
+        self.update_targets();
+    }
+
+    fn focus_index(&self, idx: usize) {
+        let id = self.sessions.lock().unwrap().get(idx).map(|s| s.id);
+        if let Some(id) = id {
+            self.focus(id);
+        }
     }
 
     fn cycle(&self, dir: i64) {
@@ -308,15 +500,16 @@ impl Daemon {
     /// positioning, so the next paint after any resize must be a full frame.
     fn resize_all(&self, size: PtySize) {
         *self.size.lock().unwrap() = size;
+        let inner = self.inner_size(size);
         for session in self.sessions.lock().unwrap().iter() {
-            let _ = session.master.lock().unwrap().resize(size);
+            let _ = session.master.lock().unwrap().resize(inner);
             session
                 .parser
                 .lock()
                 .unwrap()
-                .set_size(size.rows, size.cols);
+                .set_size(inner.rows, inner.cols);
             *session.last_frame.lock().unwrap() = None;
-            *session.applied_size.lock().unwrap() = (size.rows, size.cols);
+            *session.applied_size.lock().unwrap() = (inner.rows, inner.cols);
         }
     }
 
@@ -333,6 +526,7 @@ impl Daemon {
             }
         }
         self.send_client(&self.sessions_msg());
+        self.update_targets();
     }
 
     /// Spawn a new nvim instance. `target` None → plain scratch editor;
@@ -430,14 +624,11 @@ impl Daemon {
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
-                        let frame = {
-                            let mut parser = sess.parser.lock().unwrap();
-                            parser.process(&buf[..n]);
-                            full_frame(parser.screen())
-                        };
+                        sess.parser.lock().unwrap().process(&buf[..n]);
                         if daemon.active.load(Ordering::SeqCst) != id {
                             continue;
                         }
+                        let frame = daemon.compose_frame(&sess);
                         let mut last = sess.last_frame.lock().unwrap();
                         if last.as_deref() == Some(frame.as_slice()) {
                             continue;
@@ -457,6 +648,7 @@ impl Daemon {
         });
 
         self.send_client(&self.sessions_msg());
+        self.update_targets();
         Ok((id, title))
     }
 
@@ -468,8 +660,22 @@ impl Daemon {
                     msg.get("b64").and_then(Value::as_str),
                     self.active_session(),
                 ) {
-                    let data = B64.decode(b64).unwrap_or_default();
-                    let _ = session.writer.lock().unwrap().write_all(&data);
+                    let mut data = B64.decode(b64).unwrap_or_default();
+                    let total = *self.size.lock().unwrap();
+                    if self.sidebar_visible(total) {
+                        // Shift mouse coordinates past the sidebar; clicks
+                        // inside it switch sessions instead of reaching nvim.
+                        let (fwd, clicks) = translate_sgr_mouse(&data, SIDEBAR_WIDTH);
+                        data = fwd;
+                        for y in clicks {
+                            if y >= 2 {
+                                self.focus_index((y - 2) as usize);
+                            }
+                        }
+                    }
+                    if !data.is_empty() {
+                        let _ = session.writer.lock().unwrap().write_all(&data);
+                    }
                 }
             }
             "resize" => {
@@ -497,6 +703,21 @@ impl Daemon {
                 self.cycle(msg.get("dir").and_then(Value::as_i64).unwrap_or(1));
             }
             "list" => self.send_client(&self.sessions_msg()),
+            "sidebar" => {
+                self.sidebar.fetch_xor(true, Ordering::SeqCst);
+                let total = *self.size.lock().unwrap();
+                self.resize_all(total);
+                if let Some(session) = self.active_session() {
+                    self.repaint(&session);
+                }
+            }
+            "focus_index" => {
+                if let Some(i) = msg.get("i").and_then(Value::as_u64) {
+                    if i >= 1 {
+                        self.focus_index((i - 1) as usize);
+                    }
+                }
+            }
             "redraw" => {
                 if let Some(session) = self.active_session() {
                     self.repaint(&session);
@@ -609,6 +830,7 @@ pub fn run_daemon() -> Result<()> {
         active: AtomicU64::new(0),
         next_id: AtomicU64::new(1),
         client: Mutex::new(None),
+        sidebar: std::sync::atomic::AtomicBool::new(true),
         size: Mutex::new(PtySize {
             rows: 24,
             cols: 80,
@@ -638,7 +860,19 @@ pub fn run_daemon() -> Result<()> {
             if let Some(session) = instance.and_then(|id| daemon.session(id)) {
                 *session.title.lock().unwrap() = format!("{host}:{path}");
                 daemon.send_client(&daemon.sessions_msg());
+                daemon.update_targets();
+                if let Some(active) = daemon.active_session() {
+                    daemon.repaint(&active);
+                }
             }
+        }));
+    }
+
+    // Picker "open sessions" entries switch instances via session.focus.
+    {
+        let daemon = Arc::clone(&daemon);
+        router.set_focus_hook(Box::new(move |id| {
+            daemon.focus(id);
         }));
     }
 
@@ -698,5 +932,49 @@ mod tests {
         let frame = full_frame(parser.screen());
         let text = String::from_utf8_lossy(&frame);
         assert!(text.contains("\x1b[1;4H"), "cursor after 'abc': {text:?}");
+    }
+}
+
+#[cfg(test)]
+mod sidebar_tests {
+    use super::{render_sidebar, translate_sgr_mouse, SIDEBAR_WIDTH};
+
+    #[test]
+    fn sidebar_renders_titles_and_active_marker() {
+        let items = vec![
+            ("home:/proj/a".to_string(), true),
+            ("local scratch".to_string(), false),
+        ];
+        let mut out = Vec::new();
+        render_sidebar(&mut out, &items, 10);
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains("SESSIONS"));
+        assert!(text.contains("home:/proj/a"));
+        assert!(text.contains("local scratch"));
+        assert!(text.contains("\x1b[0;7m"), "active entry inverted");
+        assert!(!text.contains("\x1b[K"), "weakest-terminal rule holds");
+    }
+
+    #[test]
+    fn mouse_coords_shift_and_sidebar_clicks_are_captured() {
+        // click at x=30 (inside nvim area) shifts left by the sidebar width
+        let (fwd, clicks) = translate_sgr_mouse(b"\x1b[<0;30;5M", SIDEBAR_WIDTH);
+        assert_eq!(fwd, format!("\x1b[<0;{};5M", 30 - SIDEBAR_WIDTH).as_bytes());
+        assert!(clicks.is_empty());
+
+        // press on sidebar row 4 (session index 2) is swallowed + reported
+        let (fwd, clicks) = translate_sgr_mouse(b"\x1b[<0;3;4M", SIDEBAR_WIDTH);
+        assert!(fwd.is_empty());
+        assert_eq!(clicks, vec![4]);
+
+        // release in the sidebar is swallowed but not a click
+        let (fwd, clicks) = translate_sgr_mouse(b"\x1b[<0;3;4m", SIDEBAR_WIDTH);
+        assert!(fwd.is_empty());
+        assert!(clicks.is_empty());
+
+        // plain keys pass through untouched
+        let (fwd, clicks) = translate_sgr_mouse(b"hello", SIDEBAR_WIDTH);
+        assert_eq!(fwd, b"hello");
+        assert!(clicks.is_empty());
     }
 }

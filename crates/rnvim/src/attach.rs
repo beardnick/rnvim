@@ -3,6 +3,8 @@
 //!
 //!   Ctrl-\ d   detach (daemon and all sessions keep running)
 //!   Ctrl-\ n/p next / previous session
+//!   Ctrl-\ 1-9 jump to session by sidebar number
+//!   Ctrl-\ b   toggle the session sidebar
 //!   Ctrl-\ s   session list (j/k move, Enter switch, x kill, q back)
 //!   Ctrl-\ c   new scratch session
 //!   Ctrl-\ Ctrl-\  send a literal Ctrl-\ to nvim
@@ -330,6 +332,8 @@ fn handle_keys(keys: &[u8], mode: &mut Mode, stream: &mut UnixStream) -> Result<
                     b'n' => send(stream, &json!({ "t": "cycle", "dir": 1 }))?,
                     b'p' => send(stream, &json!({ "t": "cycle", "dir": -1 }))?,
                     b'c' => send(stream, &json!({ "t": "new" }))?,
+                    b'b' => send(stream, &json!({ "t": "sidebar" }))?,
+                    b'1'..=b'9' => send(stream, &json!({ "t": "focus_index", "i": (b - b'0') }))?,
                     b's' => {
                         *mode = Mode::Manager {
                             items: vec![],

@@ -88,6 +88,9 @@ scheme），为后续 LSP 代理的 URI 重写做的先手设计——翻译退�
 - [x] **多工作区路由**：broker 升级为多 agent / 多 nvim 连接路由器（消息带 host 字段路由 +
   id 重映射；`session.*` 控制方法由 broker 处理）。每个工作区独立注册 LSP 配置
   （`gopls_<slug>`），零外部依赖
+- [x] **session 侧栏 + picker 集成**：常驻左侧竖栏列出全部 session（编号 + 活动标记，
+  鼠标点击可切换，`Ctrl-\ b` 开关，`Ctrl-\ 1..9` 数字直跳，窄终端自动隐藏）；
+  `:RnvimConnect` 的候选列表顶部显示已打开 session，回车直接切换实例而非重复新建
 - [x] **daemon 化 PTY 宿主（herdr 形态）**：`rnvim daemon` 自动拉起（setsid 脱离终端），
   持有全部 nvim 实例（每 session 一个 PTY）和共享 agent 路由。客户端 raw-mode 透传，
   **detach/reattach 会话不死**——关终端重开，buffer/LSP/undo 全在

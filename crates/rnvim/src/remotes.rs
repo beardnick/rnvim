@@ -118,28 +118,45 @@ fn collect_hosts(path: &Path, home: &Path, out: &mut Vec<String>, depth: u8) {
     }
 }
 
+/// A live daemon session, listed first in the connect picker so an open
+/// workspace is a switch, not a duplicate.
+#[derive(Serialize, Clone)]
+pub struct OpenSession {
+    pub id: u64,
+    pub title: String,
+    pub active: bool,
+}
+
 #[derive(Serialize)]
 struct TargetsFile<'a> {
     recent: &'a [RecentEntry],
     hosts: &'a [String],
+    open: &'a [OpenSession],
 }
 
 /// Materialize the candidate list for the in-editor connect picker.
 pub fn write_targets_file() -> Result<PathBuf> {
-    let recent = load_recent();
-    let hosts = ssh_hosts();
     let dir = crate::nvim::rnvim_home()?.join("run");
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(format!("targets-{}.json", std::process::id()));
+    rewrite_targets_file(&path, &[])?;
+    Ok(path)
+}
+
+/// Refresh the candidate list (the daemon calls this whenever its session
+/// set changes, so pickers always see current open sessions).
+pub fn rewrite_targets_file(path: &Path, open: &[OpenSession]) -> Result<()> {
+    let recent = load_recent();
+    let hosts = ssh_hosts();
     std::fs::write(
-        &path,
+        path,
         serde_json::to_string(&TargetsFile {
             recent: &recent,
             hosts: &hosts,
+            open,
         })?,
     )
-    .with_context(|| format!("write {}", path.display()))?;
-    Ok(path)
+    .with_context(|| format!("write {}", path.display()))
 }
 
 /// Interactive pre-launch selector for bare `rnvim`. None = local editor.
