@@ -23,7 +23,11 @@ impl AgentConn {
         let mut child = cmd.spawn().with_context(|| format!("spawn {what}"))?;
         let stdin = child.stdin.take().context("agent stdin")?;
         let stdout = BufReader::new(child.stdout.take().context("agent stdout")?);
-        Ok(AgentConn { child, stdin, stdout })
+        Ok(AgentConn {
+            child,
+            stdin,
+            stdout,
+        })
     }
 
     /// Loopback agent: this same binary in `agent --stdio` mode.
@@ -46,15 +50,19 @@ impl AgentConn {
     pub fn request(&mut self, req: &Request) -> Result<Response> {
         let mut line = serde_json::to_string(req)?;
         line.push('\n');
-        self.stdin.write_all(line.as_bytes()).context("write to agent")?;
+        self.stdin
+            .write_all(line.as_bytes())
+            .context("write to agent")?;
         self.stdin.flush()?;
 
         let mut resp_line = String::new();
-        let n = self.stdout.read_line(&mut resp_line).context("read from agent")?;
+        let n = self
+            .stdout
+            .read_line(&mut resp_line)
+            .context("read from agent")?;
         if n == 0 {
             bail!("agent closed the connection (ssh failed or agent crashed)");
         }
         serde_json::from_str(resp_line.trim()).context("decode agent response")
     }
 }
-

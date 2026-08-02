@@ -34,11 +34,22 @@ pub struct RpcError {
 
 impl Response {
     pub fn ok(id: u64, result: serde_json::Value) -> Self {
-        Response { id, result: Some(result), error: None }
+        Response {
+            id,
+            result: Some(result),
+            error: None,
+        }
     }
 
     pub fn err(id: u64, code: i32, message: impl Into<String>) -> Self {
-        Response { id, result: None, error: Some(RpcError { code, message: message.into() }) }
+        Response {
+            id,
+            result: None,
+            error: Some(RpcError {
+                code,
+                message: message.into(),
+            }),
+        }
     }
 }
 

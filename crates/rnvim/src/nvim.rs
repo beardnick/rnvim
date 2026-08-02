@@ -43,9 +43,8 @@ pub fn ensure_nvim() -> Result<PathBuf> {
     let tmp_dir = rnvim_home()?.join("tmp");
     std::fs::create_dir_all(&tmp_dir)?;
     let tarball = tmp_dir.join(format!("{asset}.tar.gz"));
-    let url = format!(
-        "https://github.com/neovim/neovim/releases/download/{NVIM_VERSION}/{asset}.tar.gz"
-    );
+    let url =
+        format!("https://github.com/neovim/neovim/releases/download/{NVIM_VERSION}/{asset}.tar.gz");
 
     let status = Command::new("curl")
         .args(["-fL", "--progress-bar", "-o"])
@@ -73,7 +72,10 @@ pub fn ensure_nvim() -> Result<PathBuf> {
     if !bin.exists() {
         bail!("nvim binary missing after extract: {}", bin.display());
     }
-    eprintln!("[rnvim] Neovim {NVIM_VERSION} installed at {}", version_dir.display());
+    eprintln!(
+        "[rnvim] Neovim {NVIM_VERSION} installed at {}",
+        version_dir.display()
+    );
     Ok(bin)
 }
 
@@ -117,6 +119,8 @@ pub fn launch(opts: LaunchOpts) -> Result<i32> {
         cmd.arg(format!("+{c}"));
     }
 
-    let status = cmd.status().with_context(|| format!("launch {}", nvim.display()))?;
+    let status = cmd
+        .status()
+        .with_context(|| format!("launch {}", nvim.display()))?;
     Ok(status.code().unwrap_or(1))
 }

@@ -53,10 +53,16 @@ pub fn run_remote(target: &str, headless_cmds: &[String]) -> Result<i32> {
     let resolved = agent.request(&Request {
         id: 1,
         method: "fs.resolve".into(),
-        params: json!(ResolveParams { path: target.path.clone() }),
+        params: json!(ResolveParams {
+            path: target.path.clone()
+        }),
     })?;
     if let Some(err) = resolved.error {
-        bail!("cannot resolve remote path {:?}: {}", target.path, err.message);
+        bail!(
+            "cannot resolve remote path {:?}: {}",
+            target.path,
+            err.message
+        );
     }
     let resolved: ResolveResult =
         serde_json::from_value(resolved.result.context("fs.resolve result")?)?;
@@ -78,18 +84,32 @@ pub fn run_remote(target: &str, headless_cmds: &[String]) -> Result<i32> {
         .with_context(|| format!("bind {}", socket_path.display()))?;
 
     // 6. Broker: pump lines between nvim's socket connection and the agent.
-    let AgentConn { stdin: mut agent_in, stdout: mut agent_out, .. } = agent;
+    let AgentConn {
+        stdin: mut agent_in,
+        stdout: mut agent_out,
+        ..
+    } = agent;
     thread::spawn(move || {
-        let Ok((stream, _)) = listener.accept() else { return };
-        let Ok(read_half) = stream.try_clone() else { return };
+        let Ok((stream, _)) = listener.accept() else {
+            return;
+        };
+        let Ok(read_half) = stream.try_clone() else {
+            return;
+        };
         let mut write_half = stream;
 
         let to_agent = thread::spawn(move || {
             for line in BufReader::new(read_half).lines() {
                 let Ok(line) = line else { break };
-                if agent_in.write_all(line.as_bytes()).is_err() { break }
-                if agent_in.write_all(b"\n").is_err() { break }
-                if agent_in.flush().is_err() { break }
+                if agent_in.write_all(line.as_bytes()).is_err() {
+                    break;
+                }
+                if agent_in.write_all(b"\n").is_err() {
+                    break;
+                }
+                if agent_in.flush().is_err() {
+                    break;
+                }
             }
         });
 

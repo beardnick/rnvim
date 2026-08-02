@@ -53,7 +53,9 @@ fn dispatch(method: &str, params: Value) -> Result<Value> {
 }
 
 fn home_dir() -> PathBuf {
-    std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/"))
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/"))
 }
 
 /// Expand `~` and make relative paths home-relative (ssh convention), then
@@ -118,24 +120,38 @@ fn fs_resolve(p: ResolveParams) -> Result<Value> {
 fn fs_stat(p: StatParams) -> Result<Value> {
     let path = expand(&p.path);
     let kind = kind_of(&path);
-    let size = if kind == "file" { fs::metadata(&path).map(|m| m.len()).unwrap_or(0) } else { 0 };
-    Ok(json!(StatResult { kind: kind.to_string(), size }))
+    let size = if kind == "file" {
+        fs::metadata(&path).map(|m| m.len()).unwrap_or(0)
+    } else {
+        0
+    };
+    Ok(json!(StatResult {
+        kind: kind.to_string(),
+        size
+    }))
 }
 
 fn fs_read(p: ReadParams) -> Result<Value> {
     let path = expand(&p.path);
     let data = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
-    Ok(json!(ReadResult { content_b64: B64.encode(&data), size: data.len() as u64 }))
+    Ok(json!(ReadResult {
+        content_b64: B64.encode(&data),
+        size: data.len() as u64
+    }))
 }
 
 fn fs_write(p: WriteParams) -> Result<Value> {
     let path = expand(&p.path);
-    let data = B64.decode(p.content_b64.as_bytes()).context("decode content")?;
+    let data = B64
+        .decode(p.content_b64.as_bytes())
+        .context("decode content")?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("mkdir -p {}", parent.display()))?;
     }
     fs::write(&path, &data).with_context(|| format!("write {}", path.display()))?;
-    Ok(json!(WriteResult { bytes: data.len() as u64 }))
+    Ok(json!(WriteResult {
+        bytes: data.len() as u64
+    }))
 }
 
 fn fs_list(p: ListParams) -> Result<Value> {
@@ -164,7 +180,10 @@ mod tests {
 
     #[test]
     fn hello_checks_proto() {
-        let resp = call("hello", json!({ "client_version": "0.1.0", "proto": PROTO_VERSION }));
+        let resp = call(
+            "hello",
+            json!({ "client_version": "0.1.0", "proto": PROTO_VERSION }),
+        );
         assert!(resp.error.is_none(), "{:?}", resp.error);
         let r: HelloResult = serde_json::from_value(resp.result.unwrap()).unwrap();
         assert_eq!(r.proto, PROTO_VERSION);
@@ -204,7 +223,10 @@ mod tests {
         let names: Vec<_> = r.entries.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, vec!["sub", "a.txt"], "dirs sort first");
 
-        let resp = call("fs.stat", json!({ "path": dir.path().join("nope").to_str().unwrap() }));
+        let resp = call(
+            "fs.stat",
+            json!({ "path": dir.path().join("nope").to_str().unwrap() }),
+        );
         let r: StatResult = serde_json::from_value(resp.result.unwrap()).unwrap();
         assert_eq!(r.kind, "missing");
     }

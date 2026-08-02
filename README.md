@@ -67,4 +67,7 @@ scheme），为后续 LSP 代理的 URI 重写做的先手设计——翻译退�
 - **M2**：LSP 代理（协议层 URI 前缀重写、root_dir 接管、watcher 短路）、远程 `:terminal`
 - **M3**：finder/grep（nucleo + ignore，远程算匹配回传 top-N）、quickfix 集成
 - **M4**：QUIC 传输（0-RTT 重连、漫游）+ SSH stdio 降级、端口转发、git 只读三件套
-- 发布工程：musl 静态 agent 构建、GitHub Release、协议快照测试、docker sshd 集成测试
+- [x] 发布工程：CI（fmt/clippy/test）+ tag 触发四平台构建（含 musl 静态 agent）发布到
+  GitHub Release；客户端按需拉取远程平台的预编译 agent（本地经 `gh` 认证下载、缓存于
+  `~/.rnvim/dist/`、SSH 推送——远程机器无需访问 GitHub）
+- 待做：协议快照测试、docker sshd 集成测试、下载校验和验证

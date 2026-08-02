@@ -11,8 +11,14 @@ pub struct Target {
 impl Target {
     pub fn parse(s: &str) -> Self {
         match s.split_once(':') {
-            Some((host, path)) => Target { host: host.to_string(), path: path.to_string() },
-            None => Target { host: s.to_string(), path: String::new() },
+            Some((host, path)) => Target {
+                host: host.to_string(),
+                path: path.to_string(),
+            },
+            None => Target {
+                host: s.to_string(),
+                path: String::new(),
+            },
         }
     }
 
@@ -34,15 +40,24 @@ mod tests {
     fn parses_targets() {
         assert_eq!(
             Target::parse("dev-box:~/proj"),
-            Target { host: "dev-box".into(), path: "~/proj".into() }
+            Target {
+                host: "dev-box".into(),
+                path: "~/proj".into()
+            }
         );
         assert_eq!(
             Target::parse("user@10.0.0.1"),
-            Target { host: "user@10.0.0.1".into(), path: "".into() }
+            Target {
+                host: "user@10.0.0.1".into(),
+                path: "".into()
+            }
         );
         assert_eq!(
             Target::parse("local:/tmp/x"),
-            Target { host: "local".into(), path: "/tmp/x".into() }
+            Target {
+                host: "local".into(),
+                path: "/tmp/x".into()
+            }
         );
         assert!(Target::parse("local").is_local());
     }
