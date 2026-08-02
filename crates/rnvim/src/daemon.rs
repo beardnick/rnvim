@@ -65,13 +65,78 @@ struct Session {
     applied_size: Mutex<(u16, u16)>,
 }
 
-/// Full-screen frame: clear, redraw everything, restore cursor — applied
-/// atomically by terminals that support synchronized output.
+fn push_color(sgr: &mut String, color: vt100::Color, fg: bool) {
+    use std::fmt::Write;
+    match color {
+        vt100::Color::Default => {
+            let _ = write!(sgr, ";{}", if fg { 39 } else { 49 });
+        }
+        vt100::Color::Idx(n) => {
+            let _ = write!(sgr, ";{};5;{}", if fg { 38 } else { 48 }, n);
+        }
+        vt100::Color::Rgb(r, g, b) => {
+            let _ = write!(sgr, ";{};2;{};{};{}", if fg { 38 } else { 48 }, r, g, b);
+        }
+    }
+}
+
+/// Full-screen frame, serialized cell by cell: every cell — blanks
+/// included — is written explicitly with its own colors. This deliberately
+/// avoids EL/BCE (erase-with-background), which vt100's own serializer
+/// leans on and which weaker embedded terminals don't implement (blank
+/// regions rendered as default background). Wrapped in synchronized
+/// output so capable terminals apply the frame atomically.
 fn full_frame(screen: &vt100::Screen) -> Vec<u8> {
-    let mut bytes = b"\x1b[?2026h\x1b[2J\x1b[H".to_vec();
-    bytes.extend_from_slice(&screen.contents_formatted());
-    bytes.extend_from_slice(b"\x1b[?2026l");
-    bytes
+    let (rows, cols) = screen.size();
+    let mut out: Vec<u8> = b"\x1b[?2026h\x1b[2J".to_vec();
+    let mut current_sgr = String::new();
+
+    for row in 0..rows {
+        out.extend_from_slice(format!("\x1b[{};1H", row + 1).as_bytes());
+        let mut col = 0;
+        while col < cols {
+            let Some(cell) = screen.cell(row, col) else {
+                break;
+            };
+            let mut sgr = String::from("0");
+            if cell.bold() {
+                sgr.push_str(";1");
+            }
+            if cell.italic() {
+                sgr.push_str(";3");
+            }
+            if cell.underline() {
+                sgr.push_str(";4");
+            }
+            if cell.inverse() {
+                sgr.push_str(";7");
+            }
+            push_color(&mut sgr, cell.fgcolor(), true);
+            push_color(&mut sgr, cell.bgcolor(), false);
+            if sgr != current_sgr {
+                out.extend_from_slice(format!("\x1b[{sgr}m").as_bytes());
+                current_sgr = sgr;
+            }
+            let contents = cell.contents();
+            if contents.is_empty() {
+                out.push(b' ');
+            } else {
+                out.extend_from_slice(contents.as_bytes());
+            }
+            // A wide glyph occupies the next cell too; don't overwrite it.
+            col += if cell.is_wide() { 2 } else { 1 };
+        }
+    }
+
+    let (cursor_row, cursor_col) = screen.cursor_position();
+    out.extend_from_slice(format!("\x1b[m\x1b[{};{}H", cursor_row + 1, cursor_col + 1).as_bytes());
+    out.extend_from_slice(if screen.hide_cursor() {
+        b"\x1b[?25l"
+    } else {
+        b"\x1b[?25h"
+    });
+    out.extend_from_slice(b"\x1b[?2026l");
+    out
 }
 
 struct Daemon {
@@ -563,4 +628,45 @@ pub fn run_daemon() -> Result<()> {
         });
     }
     Err(anyhow!("control listener closed"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::full_frame;
+
+    /// The frame must not depend on BCE (erase-with-background): weak
+    /// embedded terminals render EL'd regions with the DEFAULT background,
+    /// so every blank cell has to be painted explicitly.
+    #[test]
+    fn full_frame_paints_blanks_explicitly() {
+        let mut parser = vt100::Parser::new(6, 12, 0);
+        // nvim-style clear: truecolor background + erase display + a word
+        parser.process(b"\x1b[48;2;40;44;52m\x1b[2J\x1b[HHi");
+        let frame = full_frame(parser.screen());
+        let text = String::from_utf8_lossy(&frame);
+
+        assert!(!text.contains("\x1b[K"), "must not rely on EL/BCE");
+        assert!(
+            !text.contains("\x1b[J\x1b"),
+            "must not rely on ED for content"
+        );
+        assert!(text.contains("48;2;40;44;52"), "background color present");
+        // 6 rows * 12 cols, every cell written (2 chars are 'H','i', rest blanks)
+        let spaces = frame.iter().filter(|&&b| b == b' ').count();
+        assert_eq!(spaces, 6 * 12 - 2, "every blank cell painted as a space");
+        assert!(
+            text.starts_with("\x1b[?2026h\x1b[2J"),
+            "sync + defensive clear"
+        );
+        assert!(text.ends_with("\x1b[?2026l"), "sync end");
+    }
+
+    #[test]
+    fn full_frame_positions_cursor() {
+        let mut parser = vt100::Parser::new(4, 10, 0);
+        parser.process(b"abc");
+        let frame = full_frame(parser.screen());
+        let text = String::from_utf8_lossy(&frame);
+        assert!(text.contains("\x1b[1;4H"), "cursor after 'abc': {text:?}");
+    }
 }
