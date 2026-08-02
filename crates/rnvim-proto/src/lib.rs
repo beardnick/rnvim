@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Bumped on any incompatible protocol change. Client and agent must match.
-pub const PROTO_VERSION: u32 = 1;
+pub const PROTO_VERSION: u32 = 2;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Request {
@@ -130,4 +130,26 @@ pub struct ListResult {
 pub struct DirEntry {
     pub name: String,
     pub kind: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct FindrootParams {
+    pub path: String,
+    pub markers: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct FindrootResult {
+    /// Nearest ancestor directory containing any marker, if one exists.
+    pub root: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WhichParams {
+    pub name: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WhichResult {
+    pub path: Option<String>,
 }

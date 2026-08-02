@@ -8,9 +8,11 @@ the Rust agent. Python 3.6+, stdlib only.
 import base64
 import json
 import os
+import re
+import subprocess
 import sys
 
-PROTO = 1
+PROTO = 2
 
 
 def expand(p):
@@ -84,6 +86,34 @@ def h_list(params):
     return {"entries": entries}
 
 
+def h_findroot(params):
+    p = expand(params["path"])
+    d = p if os.path.isdir(p) else os.path.dirname(p)
+    while True:
+        for m in params.get("markers", []):
+            if os.path.exists(os.path.join(d, m)):
+                return {"root": d}
+        parent = os.path.dirname(d)
+        if parent == d:
+            return {"root": None}
+        d = parent
+
+
+def h_which(params):
+    name = params["name"]
+    if not re.match(r"^[A-Za-z0-9._-]+$", name):
+        raise ValueError("invalid binary name: %r" % name)
+    shell = os.environ.get("SHELL", "/bin/sh")
+    r = subprocess.run(
+        [shell, "-lc", "command -v '%s'" % name],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        universal_newlines=True,
+    )
+    lines = [ln.strip() for ln in r.stdout.splitlines() if ln.strip()]
+    return {"path": lines[-1] if r.returncode == 0 and lines else None}
+
+
 HANDLERS = {
     "hello": h_hello,
     "fs.resolve": h_resolve,
@@ -91,6 +121,8 @@ HANDLERS = {
     "fs.read": h_read,
     "fs.write": h_write,
     "fs.list": h_list,
+    "fs.findroot": h_findroot,
+    "exec.which": h_which,
 }
 
 

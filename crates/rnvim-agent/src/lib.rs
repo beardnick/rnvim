@@ -48,6 +48,8 @@ fn dispatch(method: &str, params: Value) -> Result<Value> {
         "fs.read" => fs_read(serde_json::from_value(params)?),
         "fs.write" => fs_write(serde_json::from_value(params)?),
         "fs.list" => fs_list(serde_json::from_value(params)?),
+        "fs.findroot" => fs_findroot(serde_json::from_value(params)?),
+        "exec.which" => exec_which(serde_json::from_value(params)?),
         other => Err(anyhow!("unknown method: {other}")),
     }
 }
@@ -169,6 +171,60 @@ fn fs_list(p: ListParams) -> Result<Value> {
     Ok(json!(ListResult { entries }))
 }
 
+/// Walk up from `path` looking for the nearest directory containing any of
+/// the marker files/dirs (LSP root detection, done on the remote fs).
+fn fs_findroot(p: FindrootParams) -> Result<Value> {
+    let start = expand(&p.path);
+    let mut dir = if fs::metadata(&start).map(|m| m.is_dir()).unwrap_or(false) {
+        start
+    } else {
+        start.parent().map(Path::to_path_buf).unwrap_or(start)
+    };
+    loop {
+        if p.markers.iter().any(|m| dir.join(m).exists()) {
+            return Ok(json!(FindrootResult {
+                root: Some(dir.to_string_lossy().into_owned()),
+            }));
+        }
+        match dir.parent() {
+            Some(parent) => dir = parent.to_path_buf(),
+            None => return Ok(json!(FindrootResult { root: None })),
+        }
+    }
+}
+
+/// Locate a binary through the user's login shell, so PATH additions from
+/// profile files (~/go/bin, ~/.cargo/bin, ...) are honored — matching how
+/// the LSP proxy will actually launch the server.
+fn exec_which(p: WhichParams) -> Result<Value> {
+    if p.name.is_empty()
+        || !p
+            .name
+            .chars()
+            .all(|c| c.is_alphanumeric() || "-_.".contains(c))
+    {
+        return Err(anyhow!("invalid binary name: {:?}", p.name));
+    }
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+    let out = std::process::Command::new(shell)
+        .arg("-lc")
+        .arg(format!("command -v '{}'", p.name))
+        .output()
+        .context("run login shell")?;
+    // Profile files may print noise; the path is the last non-empty line.
+    let path = if out.status.success() {
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .rev()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .map(str::to_string)
+    } else {
+        None
+    };
+    Ok(json!(WhichResult { path }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,6 +295,49 @@ mod tests {
         assert_eq!(expand("proj/x"), home.join("proj/x"));
         assert_eq!(expand("/a/b/../c/./d"), PathBuf::from("/a/c/d"));
         assert_eq!(expand(""), home);
+    }
+
+    #[test]
+    fn findroot_walks_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("a/b/c")).unwrap();
+        fs::write(root.join("a/go.mod"), "module x").unwrap();
+        fs::write(root.join("a/b/c/main.go"), "package x").unwrap();
+
+        let resp = call(
+            "fs.findroot",
+            json!({ "path": root.join("a/b/c/main.go").to_str().unwrap(), "markers": ["go.work", "go.mod"] }),
+        );
+        let r: FindrootResult = serde_json::from_value(resp.result.unwrap()).unwrap();
+        assert_eq!(r.root.as_deref(), root.join("a").to_str());
+
+        let resp = call(
+            "fs.findroot",
+            json!({ "path": root.join("a/b/c/main.go").to_str().unwrap(), "markers": ["Cargo.toml"] }),
+        );
+        let r: FindrootResult = serde_json::from_value(resp.result.unwrap()).unwrap();
+        assert!(r.root.is_none());
+    }
+
+    #[test]
+    fn which_finds_binaries() {
+        let resp = call("exec.which", json!({ "name": "sh" }));
+        let r: WhichResult = serde_json::from_value(resp.result.unwrap()).unwrap();
+        assert!(r.path.is_some(), "sh should exist everywhere");
+
+        let resp = call(
+            "exec.which",
+            json!({ "name": "definitely-not-a-real-binary-xyz" }),
+        );
+        let r: WhichResult = serde_json::from_value(resp.result.unwrap()).unwrap();
+        assert!(r.path.is_none());
+
+        let resp = call("exec.which", json!({ "name": "evil; rm -rf /" }));
+        assert!(
+            resp.error.is_some(),
+            "shell metacharacters must be rejected"
+        );
     }
 
     #[test]

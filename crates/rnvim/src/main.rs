@@ -1,4 +1,5 @@
 mod deploy;
+mod lsp_proxy;
 mod nvim;
 mod runtime;
 mod session;
@@ -37,6 +38,19 @@ enum Cmd {
         #[arg(long)]
         stdio: bool,
     },
+    /// LSP stdio proxy: rewrite paths and run the server on the remote host
+    /// (spawned by the managed nvim; not for interactive use)
+    LspProxy {
+        /// Remote host ("local" runs the server as a plain subprocess)
+        #[arg(long)]
+        host: String,
+        /// Local workspace prefix to strip/add when rewriting paths
+        #[arg(long = "ws-root")]
+        ws_root: String,
+        /// Language server command, after `--`
+        #[arg(last = true)]
+        server: Vec<String>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -44,6 +58,14 @@ fn main() -> Result<()> {
 
     match cli.cmd {
         Some(Cmd::Agent { stdio: _ }) => rnvim_agent::run_stdio(),
+        Some(Cmd::LspProxy {
+            host,
+            ws_root,
+            server,
+        }) => {
+            let code = lsp_proxy::run(&host, &ws_root, &server)?;
+            std::process::exit(code);
+        }
         None => {
             let code = match cli.target {
                 Some(t) => session::run_remote(&t, &cli.headless_cmd)?,

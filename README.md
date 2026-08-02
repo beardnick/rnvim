@@ -64,7 +64,16 @@ scheme），为后续 LSP 代理的 URI 重写做的先手设计——翻译退�
 
 ## 路线图
 
-- **M2**：LSP 代理（协议层 URI 前缀重写、root_dir 接管、watcher 短路）、远程 `:terminal`
+- [x] **M2**：LSP 支持
+  - `rnvim lsp-proxy`：LSP stdio 代理，Content-Length 帧级 JSON 重写（本地前缀 ↔ 远程路径，
+    双向；反向所需的远程根路径从 `initialize` 请求自动捕获）
+  - 服务器在远程经用户登录 shell 启动（PATH 完整），`exec.which` 探测可用性并按需告警
+  - `fs.findroot`：root markers 在远程文件系统上探测
+  - 内置服务器集：gopls、rust-analyzer、clangd、pyright、ts_ls、lua_ls（第一方配置，
+    不依赖 lspconfig）；LSP 周边插件（补全/diagnostics UI）经 `vim.lsp` 天然兼容
+  - `:RnvimTerm`：远程终端，cd 到当前 buffer 所在目录
+  - 已知限制：字符串中段内嵌的路径不重写（只处理路径边界开头的值）；未处理百分号编码 URI；
+    文件监听暂禁用（随 QUIC 里程碑做远程 watcher）
 - **M3**：finder/grep（nucleo + ignore，远程算匹配回传 top-N）、quickfix 集成
 - **M4**：QUIC 传输（0-RTT 重连、漫游）+ SSH stdio 降级、端口转发、git 只读三件套
 - [x] 发布工程：CI（fmt/clippy/test）+ tag 触发四平台构建（含 musl 静态 agent）发布到

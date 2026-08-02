@@ -14,11 +14,16 @@ function M.setup()
     return
   end
 
-  require("rnvim.rpc").connect(socket)
-  require("rnvim.fs").setup({
+  local opts = {
     ws_root = ws_root:gsub("/+$", ""),
     host = vim.env.RNVIM_HOST or "remote",
-  })
+    rnvim_bin = vim.env.RNVIM_BIN,
+  }
+
+  require("rnvim.rpc").connect(socket)
+  require("rnvim.fs").setup(opts)
+  require("rnvim.lsp").setup(opts)
+  require("rnvim.term").setup(opts)
 end
 
 return M

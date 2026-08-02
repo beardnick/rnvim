@@ -98,6 +98,10 @@ pub fn launch(opts: LaunchOpts) -> Result<i32> {
         .env("RNVIM_RUNTIME", &runtime_dir)
         .arg("-u")
         .arg(runtime_dir.join("init.lua"));
+    if let Ok(exe) = std::env::current_exe() {
+        // The Lua runtime builds LSP proxy commands with this.
+        cmd.env("RNVIM_BIN", exe);
+    }
 
     if let Some(socket) = &opts.socket {
         cmd.env("RNVIM_SOCKET", socket);
