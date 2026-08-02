@@ -1,0 +1,19 @@
+[package]
+name = "rnvim"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "rnvim"
+path = "src/main.rs"
+
+[dependencies]
+rnvim-proto.workspace = true
+rnvim-agent.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+include_dir.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
