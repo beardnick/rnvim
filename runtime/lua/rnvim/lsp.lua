@@ -44,22 +44,67 @@ local rnvim_bin
 local which_cache = {}
 local warned = {}
 
+-- Server binaries the agent knows how to install on the remote host
+-- (self-contained release artifacts or a resident toolchain).
+local install_recipes = {
+  ["rust-analyzer"] = "rust-analyzer",
+  ["lua-language-server"] = "lua-language-server",
+  ["gopls"] = "gopls",
+  ["clangd"] = "clangd",
+  ["pyright-langserver"] = "pyright",
+  ["typescript-language-server"] = "typescript-language-server",
+}
+local installing = {}
+
 local function is_null(v)
   return v == nil or v == vim.NIL
 end
 
-local function server_available(bin, host)
+--- Install a missing server on the remote, then re-trigger attach for the
+--- buffer that wanted it. One attempt per host+binary.
+local function try_install(bin, host, bufnr)
+  local recipe = install_recipes[bin]
+  local key = host .. ":" .. bin
+  if not recipe then
+    if not warned[key] then
+      warned[key] = true
+      vim.notify(
+        ("[rnvim] %s not found on %s — install it there to enable LSP"):format(bin, host),
+        vim.log.levels.WARN
+      )
+    end
+    return
+  end
+  if installing[key] then
+    return
+  end
+  installing[key] = true
+  vim.notify(("[rnvim] installing %s on %s (first use)..."):format(bin, host))
+  rpc.request_async(host, "exec.install", { name = recipe }, function(err, res)
+    if err then
+      vim.notify(
+        ("[rnvim] could not install %s on %s: %s"):format(bin, host, err),
+        vim.log.levels.WARN
+      )
+      return
+    end
+    which_cache[key] = true
+    vim.notify(("[rnvim] %s installed on %s (%s)"):format(bin, host, res.path))
+    if bufnr and vim.api.nvim_buf_is_valid(bufnr) then
+      -- Re-run the FileType machinery so vim.lsp.enable attaches now.
+      vim.api.nvim_exec_autocmds("FileType", { buffer = bufnr })
+    end
+  end)
+end
+
+local function server_available(bin, host, bufnr)
   local key = host .. ":" .. bin
   if which_cache[key] == nil then
     local ok, res = pcall(rpc.request, host, "exec.which", { name = bin })
     which_cache[key] = ok and not is_null(res.path)
   end
-  if not which_cache[key] and not warned[key] then
-    warned[key] = true
-    vim.notify(
-      ("[rnvim] %s not found on %s — install it there to enable LSP"):format(bin, host),
-      vim.log.levels.WARN
-    )
+  if not which_cache[key] then
+    try_install(bin, host, bufnr)
   end
   return which_cache[key]
 end
@@ -91,7 +136,7 @@ function M.register_workspace(ws)
         if workspaces.of_file(file) ~= ws then
           return -- another workspace's copy will pick this buffer up
         end
-        if not server_available(def.cmd[1], ws.host) then
+        if not server_available(def.cmd[1], ws.host, bufnr) then
           return
         end
         local remote = workspaces.remote_path(file, ws)
@@ -105,11 +150,20 @@ function M.register_workspace(ws)
         end
         on_dir(ws.ws_root .. root)
       end,
-      capabilities = {
-        workspace = {
-          didChangeWatchedFiles = { dynamicRegistration = false },
-        },
-      },
+      capabilities = (function()
+        local caps = {
+          workspace = {
+            didChangeWatchedFiles = { dynamicRegistration = false },
+          },
+        }
+        -- If the user's config brought a completion engine, advertise its
+        -- capabilities to the remote servers too.
+        local ok, blink = pcall(require, "blink.cmp")
+        if ok and blink.get_lsp_capabilities then
+          caps = vim.tbl_deep_extend("force", blink.get_lsp_capabilities(), caps)
+        end
+        return caps
+      end)(),
     })
   end
   vim.lsp.enable(names)

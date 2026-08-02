@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Bumped on any incompatible protocol change. Client and agent must match.
-pub const PROTO_VERSION: u32 = 3;
+pub const PROTO_VERSION: u32 = 4;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Request {
@@ -152,6 +152,16 @@ pub struct WhichParams {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct WhichResult {
     pub path: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct InstallParams {
+    pub name: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct InstallResult {
+    pub path: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

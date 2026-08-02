@@ -5,9 +5,13 @@
 
 mod finder;
 
+mod install;
+pub use install::TOOLS_PATH;
+
 use std::fs;
 use std::io::{self, BufRead, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Context, Result};
 use base64::engine::general_purpose::STANDARD as B64;
@@ -15,19 +19,40 @@ use base64::Engine;
 use rnvim_proto::*;
 use serde_json::{json, Value};
 
+fn write_response(stdout: &Mutex<io::Stdout>, resp: &Response) {
+    if let Ok(mut out) = serde_json::to_string(resp) {
+        out.push('\n');
+        let mut stdout = stdout.lock().unwrap();
+        let _ = stdout.write_all(out.as_bytes());
+        let _ = stdout.flush();
+    }
+}
+
 pub fn run_stdio() -> Result<()> {
     let stdin = io::stdin().lock();
-    let mut stdout = io::stdout().lock();
+    let stdout = Arc::new(Mutex::new(io::stdout()));
     for line in stdin.lines() {
         let line = line.context("read stdin")?;
         if line.trim().is_empty() {
             continue;
         }
+        // Installs download for minutes; never block the request loop.
+        // Responses are id-matched, so out-of-order delivery is fine.
+        if let Ok(req) = serde_json::from_str::<Request>(&line) {
+            if req.method == "exec.install" {
+                let stdout = Arc::clone(&stdout);
+                std::thread::spawn(move || {
+                    let resp = match dispatch(&req.method, req.params) {
+                        Ok(result) => Response::ok(req.id, result),
+                        Err(e) => Response::err(req.id, ERR_IO, e.to_string()),
+                    };
+                    write_response(&stdout, &resp);
+                });
+                continue;
+            }
+        }
         let resp = handle_line(&line);
-        let mut out = serde_json::to_string(&resp).context("encode response")?;
-        out.push('\n');
-        stdout.write_all(out.as_bytes()).context("write stdout")?;
-        stdout.flush().context("flush stdout")?;
+        write_response(&stdout, &resp);
     }
     Ok(())
 }
@@ -52,6 +77,7 @@ fn dispatch(method: &str, params: Value) -> Result<Value> {
         "fs.list" => fs_list(serde_json::from_value(params)?),
         "fs.findroot" => fs_findroot(serde_json::from_value(params)?),
         "exec.which" => exec_which(serde_json::from_value(params)?),
+        "exec.install" => exec_install(serde_json::from_value(params)?),
         "find.files" => finder::find_files(serde_json::from_value(params)?),
         "find.grep" => finder::find_grep(serde_json::from_value(params)?),
         other => Err(anyhow!("unknown method: {other}")),
@@ -212,7 +238,11 @@ fn exec_which(p: WhichParams) -> Result<Value> {
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
     let out = std::process::Command::new(shell)
         .arg("-lc")
-        .arg(format!("command -v '{}'", p.name))
+        .arg(format!(
+            "PATH=\"{}:$PATH\" command -v '{}'",
+            install::TOOLS_PATH,
+            p.name
+        ))
         .output()
         .context("run login shell")?;
     // Profile files may print noise; the path is the last non-empty line.
@@ -227,6 +257,13 @@ fn exec_which(p: WhichParams) -> Result<Value> {
         None
     };
     Ok(json!(WhichResult { path }))
+}
+
+/// Install an LSP server on this host from a known recipe. Runs on a
+/// dedicated thread (see run_stdio) — may take minutes.
+fn exec_install(p: InstallParams) -> Result<Value> {
+    let path = install::install(&p.name)?;
+    Ok(json!(InstallResult { path }))
 }
 
 #[cfg(test)]

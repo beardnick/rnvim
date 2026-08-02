@@ -150,20 +150,28 @@ fn spawn_server(host: &str, server_cmd: &[String]) -> Result<Child> {
     let mut cmd = if host == "local" {
         let mut c = Command::new(&server_cmd[0]);
         c.args(&server_cmd[1..]);
+        if let (Ok(home), Ok(path)) = (std::env::var("HOME"), std::env::var("PATH")) {
+            c.env(
+                "PATH",
+                format!("{home}/.rnvim/tools/bin:{home}/.rnvim/tools/npm/node_modules/.bin:{path}"),
+            );
+        }
         c
     } else {
-        // Through the user's login shell so PATH from profile files applies
-        // (mirrors how exec.which probes availability).
+        // Through the user's login shell so PATH from profile files applies,
+        // with rnvim-installed tools prepended (mirrors exec.which).
         let quoted: Vec<String> = server_cmd.iter().map(|a| shell_quote(a)).collect();
+        let script = format!(
+            "PATH=\"{}:$PATH\" exec {}",
+            rnvim_agent::TOOLS_PATH,
+            quoted.join(" ")
+        );
         let mut c = Command::new("ssh");
         c.args([
             "-o",
             "BatchMode=yes",
             host,
-            &format!(
-                "exec \"${{SHELL:-/bin/sh}}\" -lc {}",
-                shell_quote(&quoted.join(" "))
-            ),
+            &format!("exec \"${{SHELL:-/bin/sh}}\" -lc {}", shell_quote(&script)),
         ]);
         c
     };

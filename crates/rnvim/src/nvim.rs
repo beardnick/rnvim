@@ -15,6 +15,24 @@ pub fn rnvim_home() -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(".rnvim"))
 }
 
+/// User-editable settings, ~/.rnvim/config.json. Everything defaults off:
+/// rnvim stays fully isolated unless explicitly told otherwise.
+#[derive(serde::Deserialize, Default)]
+pub struct RnvimConfig {
+    /// Load the user's own ~/.config/nvim inside rnvim (it can branch on
+    /// vim.g.rnvim, vscode-neovim style).
+    #[serde(default)]
+    pub user_config: bool,
+}
+
+pub fn load_config() -> RnvimConfig {
+    rnvim_home()
+        .ok()
+        .and_then(|home| std::fs::read_to_string(home.join("config.json")).ok())
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
 fn asset_name() -> Result<&'static str> {
     Ok(match (env::consts::OS, env::consts::ARCH) {
         ("macos", "aarch64") => "nvim-macos-arm64",
@@ -143,6 +161,13 @@ pub fn plan(opts: &LaunchOpts) -> Result<LaunchPlan> {
     if let Ok(exe) = std::env::current_exe() {
         // The Lua runtime builds LSP proxy commands with this.
         envs.push(("RNVIM_BIN".to_string(), exe.to_string_lossy().into_owned()));
+    }
+    envs.push((
+        "RNVIM_VERSION".to_string(),
+        env!("CARGO_PKG_VERSION").to_string(),
+    ));
+    if load_config().user_config {
+        envs.push(("RNVIM_USER_CONFIG".to_string(), "1".to_string()));
     }
     let mut env_path = |key: &str, value: Option<&PathBuf>| {
         if let Some(v) = value {
