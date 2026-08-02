@@ -1,3 +1,5 @@
+mod attach;
+mod daemon;
 mod deploy;
 mod lsp_proxy;
 mod nvim;
@@ -52,6 +54,8 @@ enum Cmd {
         #[arg(last = true)]
         server: Vec<String>,
     },
+    /// Run the session daemon (started automatically; not for interactive use)
+    Daemon,
 }
 
 fn main() -> Result<()> {
@@ -67,12 +71,23 @@ fn main() -> Result<()> {
             let code = lsp_proxy::run(&host, &ws_root, &server)?;
             std::process::exit(code);
         }
+        Some(Cmd::Daemon) => daemon::run_daemon(),
         None => {
+            // Headless runs (tests, scripting) bypass the daemon entirely.
+            if !cli.headless_cmd.is_empty() {
+                let code = session::run(cli.target.as_deref(), &cli.headless_cmd)?;
+                std::process::exit(code);
+            }
             let mut target = cli.target;
-            if target.is_none() && cli.headless_cmd.is_empty() {
+            let daemon_up = daemon::control_socket_path()
+                .map(|p| std::os::unix::net::UnixStream::connect(p).is_ok())
+                .unwrap_or(false);
+            // First launch offers the target selector; once the daemon is
+            // up, a bare `rnvim` means "reattach to my sessions".
+            if target.is_none() && !daemon_up {
                 target = remotes::select_target()?;
             }
-            let code = session::run(target.as_deref(), &cli.headless_cmd)?;
+            let code = attach::run(target.as_deref())?;
             std::process::exit(code);
         }
     }

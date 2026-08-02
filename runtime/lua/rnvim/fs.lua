@@ -15,6 +15,13 @@ local function buf_workspace(bufnr)
   return ws, file
 end
 
+local function short(path)
+  if #path > 50 then
+    return "..." .. path:sub(-49)
+  end
+  return path
+end
+
 local function set_text(bufnr, text)
   local lines = vim.split(text, "\n", { plain = true })
   local eol = true
@@ -76,12 +83,12 @@ local function read_buf(bufnr)
 
   if st.kind == "missing" then
     vim.bo[bufnr].modified = false
-    vim.api.nvim_echo({ { ('"%s" [New File] (rnvim: %s)'):format(remote, ws.host) } }, false, {})
+    vim.api.nvim_echo({ { ('"%s" [New File] (rnvim: %s)'):format(short(remote), ws.host) } }, false, {})
   else
     local res = rpc.request(ws.host, "fs.read", { path = remote })
     set_text(bufnr, vim.base64.decode(res.content_b64))
     vim.bo[bufnr].modified = false
-    vim.api.nvim_echo({ { ('"%s" %dB (rnvim: %s)'):format(remote, res.size, ws.host) } }, false, {})
+    vim.api.nvim_echo({ { ('"%s" %dB (rnvim: %s)'):format(short(remote), res.size, ws.host) } }, false, {})
   end
 
   local ft = vim.filetype.match({ filename = remote, buf = bufnr })
@@ -102,7 +109,7 @@ local function write_buf(bufnr)
   local res = rpc.request(ws.host, "fs.write", { path = remote, content_b64 = vim.base64.encode(text) })
   vim.bo[bufnr].modified = false
   vim.api.nvim_echo(
-    { { ('"%s" %dL, %dB written (rnvim: %s)'):format(remote, #lines, res.bytes, ws.host) } },
+    { { ('"%s" %dL, %dB written (rnvim: %s)'):format(short(remote), #lines, res.bytes, ws.host) } },
     false,
     {}
   )

@@ -56,12 +56,65 @@ local function move(delta)
   pcall(vim.api.nvim_win_set_cursor, state.list_win, { state.selected, 0 })
 end
 
+local function retitle(title)
+  if state and state.list_win then
+    pcall(vim.api.nvim_win_set_config, state.list_win, { title = title, title_pos = "center" })
+  end
+end
+
+local function clear_query()
+  if not state then
+    return
+  end
+  vim.api.nvim_buf_set_lines(state.prompt_buf, 0, -1, false, { state.prompt_prefix })
+  pcall(vim.api.nvim_win_set_cursor, state.prompt_win, { 1, #state.prompt_prefix })
+end
+
+--- Fetch a remote directory for browse mode (agent connected lazily by the
+--- broker on first call — this is the connect flow's directory stage).
+local function fetch_browse(path)
+  if not state then
+    return
+  end
+  local host = state.browse_host
+  rpc.request_async(nil, "session.browse", { host = host, path = path }, function(err, res)
+    if not state or state.mode ~= "browse" then
+      return
+    end
+    if err then
+      vim.notify("[rnvim] browse failed: " .. err, vim.log.levels.ERROR)
+      return
+    end
+    state.browse_path = res.abs
+    state.browse_entries = res.entries or {}
+    retitle((" rnvim browse %s:%s · <CR> enter · <C-s> choose this dir "):format(host, res.abs))
+    clear_query()
+    require("rnvim.picker")._research()
+  end)
+end
+
 local function search(query)
   if not state then
     return
   end
   state.gen = state.gen + 1
   local gen = state.gen
+  if state.mode == "browse" then
+    local q = query:lower()
+    local items = {}
+    if state.browse_path and state.browse_path ~= "/" then
+      items[#items + 1] = { display = "../", up = true }
+    end
+    for _, e in ipairs(state.browse_entries or {}) do
+      if e.kind == "dir" and (q == "" or e.name:lower():find(q, 1, true)) then
+        items[#items + 1] = { display = e.name .. "/", name = e.name }
+      end
+    end
+    state.items = items
+    state.selected = 1
+    render()
+    return
+  end
   if state.mode == "connect" then
     local q = query:lower()
     local items = {}
@@ -151,15 +204,39 @@ local function accept()
   end
   local item = state.items[state.selected]
 
+  if state.mode == "browse" then
+    -- <CR> descends; <C-s> chooses the current directory.
+    local next_path
+    if item.up then
+      next_path = vim.fs.dirname(state.browse_path)
+    else
+      next_path = state.browse_path:gsub("/+$", "") .. "/" .. item.name
+    end
+    fetch_browse(next_path)
+    return
+  end
+
   if state.mode == "connect" then
+    local target = item.target
+    if not target:find(":", 1, true) then
+      -- Host without a path: enter the directory-selection stage before
+      -- anything becomes a session.
+      close()
+      M.open_browse(target, "connect")
+      return
+    end
     close()
-    vim.notify("[rnvim] connecting to " .. item.target .. "...")
-    rpc.request_async(nil, "session.connect", { target = item.target }, function(err, info)
+    vim.notify("[rnvim] connecting to " .. target .. "...")
+    rpc.request_async(nil, "session.connect", { target = target }, function(err, info)
       if err then
         vim.notify("[rnvim] connect failed: " .. err, vim.log.levels.ERROR)
         return
       end
-      open_workspace(info)
+      if info.instance then
+        vim.notify(("[rnvim] opened %s in a new session"):format(info.title or target))
+      else
+        open_workspace(info) -- legacy direct mode: in-editor tab
+      end
     end)
     return
   end
@@ -188,6 +265,49 @@ local function to_quickfix()
   close()
   vim.fn.setqflist(qf, " ")
   vim.cmd.copen()
+end
+
+--- <C-s> in browse mode: the currently browsed directory becomes the root.
+local function choose_dir()
+  if not state or state.mode ~= "browse" then
+    return
+  end
+  local host, path, purpose = state.browse_host, state.browse_path, state.browse_purpose
+  if not path then
+    return
+  end
+  close()
+
+  if purpose == "connect" then
+    local target = host .. ":" .. path
+    vim.notify("[rnvim] connecting to " .. target .. "...")
+    rpc.request_async(nil, "session.connect", { target = target }, function(err, info)
+      if err then
+        vim.notify("[rnvim] connect failed: " .. err, vim.log.levels.ERROR)
+        return
+      end
+      if info.instance then
+        vim.notify(("[rnvim] opened %s in a new session"):format(info.title or target))
+      else
+        open_workspace(info)
+      end
+    end)
+    return
+  end
+
+  -- purpose == "root": this instance adopts the directory as its session
+  -- root (records it as recent, retitles the daemon session).
+  rpc.request_async(nil, "session.rooted", {
+    host = host,
+    path = path,
+    instance = tonumber(vim.env.RNVIM_INSTANCE),
+  }, function() end)
+  local ws = workspaces.by_host[host]
+  if ws then
+    ws.entry = path
+    ws.project_root = nil
+    vim.cmd.edit(vim.fn.fnameescape(ws.ws_root .. path:gsub("/+$", "")))
+  end
 end
 
 --- Project root on the workspace's remote: nearest .git above its entry,
@@ -238,7 +358,7 @@ function M.open(mode)
   end
 
   local ws, root
-  if mode ~= "connect" then
+  if mode ~= "connect" and mode ~= "browse" then
     ws = workspaces.current()
     if not ws then
       vim.notify("[rnvim] no active workspace — :RnvimConnect first", vim.log.levels.WARN)
@@ -260,7 +380,9 @@ function M.open(mode)
 
   local title
   if mode == "connect" then
-    title = " rnvim connect · <CR> opens in a new tab "
+    title = " rnvim connect · <CR> select "
+  elseif mode == "browse" then
+    title = " rnvim browse "
   else
     title = (" rnvim %s: %s:%s "):format(mode, ws.host, root)
   end
@@ -338,9 +460,31 @@ function M.open(mode)
     move(-1)
   end)
   imap("<C-q>", to_quickfix)
+  imap("<C-s>", choose_dir)
 
   vim.cmd.startinsert()
-  search("")
+  if mode ~= "browse" then
+    search("")
+  end
+end
+
+--- Directory-selection stage: browse `host` and pick a directory.
+--- purpose "connect" → new session there; "root" → re-root this instance.
+function M.open_browse(host, purpose)
+  M.open("browse")
+  if not state then
+    return
+  end
+  state.browse_host = host
+  state.browse_purpose = purpose
+  fetch_browse("~")
+end
+
+--- Re-run the current search (used by async browse fetches).
+function M._research()
+  if state then
+    search(current_query())
+  end
 end
 
 --- Workspace pickers + the connect switcher.

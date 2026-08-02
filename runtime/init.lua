@@ -12,6 +12,9 @@ vim.o.ignorecase = true
 vim.o.smartcase = true
 vim.o.signcolumn = "yes"
 vim.o.updatetime = 300
+-- Truncate long messages instead of blocking on hit-enter prompts; a
+-- prompt pending across detach/reattach also stalls the repaint RPC.
+vim.opt.shortmess:append("aT")
 
 require("rnvim").setup()
 

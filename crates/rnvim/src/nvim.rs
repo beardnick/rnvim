@@ -92,55 +92,95 @@ pub struct LaunchOpts {
     pub targets_file: Option<PathBuf>,
     /// File or directory to open (already mapped into the workspace prefix).
     pub entry: Option<PathBuf>,
+    /// The instance starts without a chosen session root: the Lua runtime
+    /// opens the remote directory browser on startup instead of a file.
+    pub pending_root: bool,
+    /// Daemon session id (lets the instance identify itself to the broker).
+    pub instance: Option<u64>,
+    /// nvim --listen socket (must precede positional args, or nvim treats
+    /// it as a filename).
+    pub listen: Option<PathBuf>,
     pub headless_cmds: Vec<String>,
+}
+
+/// Everything needed to spawn the managed nvim, regardless of who spawns it
+/// (a foreground Command or a daemon-held PTY).
+pub struct LaunchPlan {
+    pub bin: PathBuf,
+    pub args: Vec<String>,
+    pub envs: Vec<(String, String)>,
+}
+
+pub fn plan(opts: &LaunchOpts) -> Result<LaunchPlan> {
+    let nvim = ensure_nvim()?;
+    let runtime_dir = crate::runtime::ensure_runtime()?;
+
+    let mut envs = vec![
+        ("NVIM_APPNAME".to_string(), "rnvim".to_string()),
+        (
+            "RNVIM_RUNTIME".to_string(),
+            runtime_dir.to_string_lossy().into_owned(),
+        ),
+    ];
+    if let Ok(exe) = std::env::current_exe() {
+        // The Lua runtime builds LSP proxy commands with this.
+        envs.push(("RNVIM_BIN".to_string(), exe.to_string_lossy().into_owned()));
+    }
+    let mut env_path = |key: &str, value: Option<&PathBuf>| {
+        if let Some(v) = value {
+            envs.push((key.to_string(), v.to_string_lossy().into_owned()));
+        }
+    };
+    env_path("RNVIM_SOCKET", opts.socket.as_ref());
+    env_path("RNVIM_WS_ROOT", opts.ws_root.as_ref());
+    env_path("RNVIM_TARGETS", opts.targets_file.as_ref());
+    env_path("RNVIM_WS_BASE", opts.ws_base.as_ref());
+    if let Some(host) = &opts.host {
+        envs.push(("RNVIM_HOST".to_string(), host.clone()));
+    }
+    if let Some(entry) = &opts.remote_entry {
+        envs.push(("RNVIM_REMOTE_ENTRY".to_string(), entry.clone()));
+    }
+    if opts.pending_root {
+        envs.push(("RNVIM_PENDING_ROOT".to_string(), "1".to_string()));
+    }
+    if let Some(instance) = opts.instance {
+        envs.push(("RNVIM_INSTANCE".to_string(), instance.to_string()));
+    }
+
+    let mut args = vec![
+        "-u".to_string(),
+        runtime_dir.join("init.lua").to_string_lossy().into_owned(),
+    ];
+    if let Some(listen) = &opts.listen {
+        args.push("--listen".to_string());
+        args.push(listen.to_string_lossy().into_owned());
+    }
+    if !opts.headless_cmds.is_empty() {
+        args.push("--headless".to_string());
+    }
+    if let Some(entry) = &opts.entry {
+        args.push(entry.to_string_lossy().into_owned());
+    }
+    for c in &opts.headless_cmds {
+        args.push(format!("+{c}"));
+    }
+
+    Ok(LaunchPlan {
+        bin: nvim,
+        args,
+        envs,
+    })
 }
 
 /// Launch the managed nvim in the foreground and wait for it to exit.
 pub fn launch(opts: LaunchOpts) -> Result<i32> {
-    let nvim = ensure_nvim()?;
-    let runtime_dir = crate::runtime::ensure_runtime()?;
-
-    let mut cmd = Command::new(&nvim);
-    cmd.env("NVIM_APPNAME", "rnvim")
-        .env("RNVIM_RUNTIME", &runtime_dir)
-        .arg("-u")
-        .arg(runtime_dir.join("init.lua"));
-    if let Ok(exe) = std::env::current_exe() {
-        // The Lua runtime builds LSP proxy commands with this.
-        cmd.env("RNVIM_BIN", exe);
-    }
-
-    if let Some(socket) = &opts.socket {
-        cmd.env("RNVIM_SOCKET", socket);
-    }
-    if let Some(ws_root) = &opts.ws_root {
-        cmd.env("RNVIM_WS_ROOT", ws_root);
-    }
-    if let Some(host) = &opts.host {
-        cmd.env("RNVIM_HOST", host);
-    }
-    if let Some(entry) = &opts.remote_entry {
-        cmd.env("RNVIM_REMOTE_ENTRY", entry);
-    }
-    if let Some(targets) = &opts.targets_file {
-        cmd.env("RNVIM_TARGETS", targets);
-    }
-    if let Some(base) = &opts.ws_base {
-        cmd.env("RNVIM_WS_BASE", base);
-    }
-
-    if !opts.headless_cmds.is_empty() {
-        cmd.arg("--headless");
-    }
-    if let Some(entry) = &opts.entry {
-        cmd.arg(entry);
-    }
-    for c in &opts.headless_cmds {
-        cmd.arg(format!("+{c}"));
-    }
-
+    let plan = plan(&opts)?;
+    let mut cmd = Command::new(&plan.bin);
+    cmd.args(&plan.args)
+        .envs(plan.envs.iter().map(|(k, v)| (k, v)));
     let status = cmd
         .status()
-        .with_context(|| format!("launch {}", nvim.display()))?;
+        .with_context(|| format!("launch {}", plan.bin.display()))?;
     Ok(status.code().unwrap_or(1))
 }

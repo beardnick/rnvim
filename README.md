@@ -85,11 +85,21 @@ scheme），为后续 LSP 代理的 URI 重写做的先手设计——翻译退�
     Include）出 host 列表，`~/.rnvim/recent.json` 记住最近工作区（host + 目录，去重上限
     50）；编辑器内选中目标即无缝切换会话（handoff + 客户端外层循环）
   - agent 文件列表带 10s 缓存；20 万文件硬上限防止病态目录拖垮 agent
-- [x] **多工作区（单实例）**：client broker 升级为多 agent 路由器（消息带 host 字段路由，
-  `session.connect` 由 broker 处理：部署 agent、握手、解析路径）。`:RnvimConnect` 选中
-  目标后**在新 tab 打开工作区**而不是重启会话——多台远程机器的 buffer 在同一个编辑器里
-  共存，`gt`/`:tabnext` 切换，跨机器 split/diff 都可以。每个工作区独立注册 LSP 配置
+- [x] **多工作区路由**：broker 升级为多 agent / 多 nvim 连接路由器（消息带 host 字段路由 +
+  id 重映射；`session.*` 控制方法由 broker 处理）。每个工作区独立注册 LSP 配置
   （`gopls_<slug>`），零外部依赖
+- [x] **daemon 化 PTY 宿主（herdr 形态）**：`rnvim daemon` 自动拉起（setsid 脱离终端），
+  持有全部 nvim 实例（每 session 一个 PTY）和共享 agent 路由。客户端 raw-mode 透传，
+  **detach/reattach 会话不死**——关终端重开，buffer/LSP/undo 全在
+  - 前缀键 `Ctrl-\`：`d` detach · `n`/`p` 切换实例 · `s` 会话列表 · `c` 新建 ·
+    `Ctrl-\ Ctrl-\` 发送字面量
+  - 无终端仿真：单实例全屏可见，重绘 = PTY resize + nvim RPC `redraw!`（带超时，
+    模态提示不会卡死控制环）；慢客户端由有界队列保护，绝不冻结 nvim
+  - `:RnvimConnect` 现在开**新实例**（daemon 会话）而非当前编辑器内的 tab
+  - `--headless-cmd` 保留旧直连模式（测试/脚本用，不经 daemon）
+- [x] **连接的目录选择阶段**：`rnvim host`（不带路径）先进入远程目录浏览器
+  （`<CR>` 进入子目录 · `<C-s>` 选定当前目录为 session 根）,选完才正式成为 session；
+  `:RnvimConnect` 选了裸 host 同样先走目录浏览。recent 记录的是选定的项目目录而非 home
 - **M4**：QUIC 传输（0-RTT 重连、漫游）+ SSH stdio 降级、端口转发、git 只读三件套
 - [x] 发布工程：CI（fmt/clippy/test）+ tag 触发四平台构建（含 musl 静态 agent）发布到
   GitHub Release；客户端按需拉取远程平台的预编译 agent（本地经 `gh` 认证下载、缓存于

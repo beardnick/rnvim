@@ -29,6 +29,13 @@ function M.setup()
     require("rnvim.lsp").register_workspace(ws)
     workspaces.last_active = ws
     vim.t.rnvim_ws = ws.slug
+
+    -- Connected to a host without a path: choose the session root first.
+    if vim.env.RNVIM_PENDING_ROOT == "1" then
+      vim.schedule(function()
+        require("rnvim.picker").open_browse(host, "root")
+      end)
+    end
   end
 end
 
