@@ -1,22 +1,22 @@
--- :RnvimTerm — a terminal on the current workspace's host, cd'd to the
--- current buffer's remote directory (plain local terminal for `local`).
+-- :RnvimTerm — a terminal on the workspace host, cd'd to the current
+-- buffer's remote directory (plain local terminal for `local:`).
 
-local workspaces = require("rnvim.workspaces")
+local workspace = require("rnvim.workspace")
 
 local M = {}
 
 function M.setup()
   vim.api.nvim_create_user_command("RnvimTerm", function()
-    local ws = workspaces.current()
+    local ws = workspace.current()
     if not ws then
-      vim.notify("[rnvim] no active workspace — :RnvimConnect first", vim.log.levels.WARN)
+      vim.notify("[rnvim] this instance has no workspace", vim.log.levels.WARN)
       return
     end
 
     local dir = "~"
     local file = vim.api.nvim_buf_get_name(0)
-    if workspaces.of_file(file) == ws then
-      local remote = workspaces.remote_path(file, ws)
+    if workspace.of_file(file) then
+      local remote = workspace.remote_path(file)
       local d = vim.bo.filetype == "rnvimdir" and remote or vim.fs.dirname(remote)
       if d and d ~= "" then
         dir = d
@@ -31,7 +31,7 @@ function M.setup()
         "ssh",
         "-t",
         ws.host,
-        ("cd %s 2>/dev/null; exec \"${SHELL:-/bin/sh}\" -l"):format(vim.fn.shellescape(dir)),
+        ('cd %s 2>/dev/null; exec "${SHELL:-/bin/sh}" -l'):format(vim.fn.shellescape(dir)),
       }, { term = true })
     end
     vim.cmd.startinsert()

@@ -4,11 +4,10 @@
 --
 --   vim.g.rnvim_lsp_recipes = { ["my-ls"] = [[...script...]] }
 --
--- Without a user recipe, installs go through the broker's session.install:
--- the mason-registry plan is resolved locally, artifacts are downloaded on
--- the LOCAL machine (cached, GitHub-reachable side) and staged to the
--- remote through the agent — the remote needs no GitHub access. npm/golang
--- packages run remotely via the remote's own package manager and mirrors.
+-- Without a user recipe, installs go through the mason-registry planner
+-- (rnvim.registry): the plan is resolved locally, github artifacts are
+-- downloaded on the remote by the agent's native HTTP client, npm/golang
+-- packages run through the remote's own package manager and mirrors.
 
 local M = {}
 

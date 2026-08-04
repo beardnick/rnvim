@@ -1,0 +1,30 @@
+#!/bin/sh
+# rnvim <target> — open a remote workspace in a fresh nvim instance.
+#
+#   rnvim dev-box:~/project     remote workspace
+#   rnvim dev-box               remote host (directory selection inside)
+#   rnvim local:/tmp/dir        loopback (dev/testing, no ssh)
+#
+# Inside tmux, opens a new window (detachable session); otherwise runs
+# nvim in the foreground. The target travels via the environment so no
+# shell quoting of user input is ever interpolated into Lua.
+
+set -e
+
+if [ -z "$1" ] || [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
+  echo "usage: rnvim <[user@]host[:path]>" >&2
+  exit 2
+fi
+
+RNVIM_TARGET="$1"
+export RNVIM_TARGET
+
+boot="lua vim.g.rnvim = { target = vim.env.RNVIM_TARGET }"
+
+if [ -n "$TMUX" ]; then
+  slug=$(printf '%s' "${RNVIM_TARGET%%:*}" | tr ':/' '__')
+  exec tmux new-window -n "$slug" -e "RNVIM_TARGET=$RNVIM_TARGET" \
+    "nvim --cmd 'lua vim.g.rnvim = { target = vim.env.RNVIM_TARGET }'"
+fi
+
+exec nvim --cmd "$boot"
