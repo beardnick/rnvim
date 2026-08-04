@@ -3,6 +3,10 @@ name = "rnvim-agent"
 version.workspace = true
 edition.workspace = true
 
+[[bin]]
+name = "rnvim-agent"
+path = "src/main.rs"
+
 [dependencies]
 rnvim-proto.workspace = true
 anyhow.workspace = true

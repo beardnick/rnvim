@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/rnvim", "crates/rnvim-proto", "crates/rnvim-agent"]
+members = ["crates/rnvim-proto", "crates/rnvim-agent"]
 
 [workspace.package]
 version = "0.9.5"
