@@ -1,120 +1,85 @@
 # rnvim
 
-远程开发工具：**编辑在本地，文件和智能在远程**——VSCode Remote 的架构，Neovim 的内核。
+Remote development tool: **edit locally, files and intelligence live remotely** — VSCode Remote's architecture with Neovim at the core.
 
 ```bash
 rnvim dev-box:~/project
 ```
 
-一条命令：自动下载锁定版本的 Neovim（与用户已有的 Neovim 完全隔离）、通过 SSH 自动部署远程
-agent、在本地打开远程工作区。buffer 在本地，打字零延迟；文件、LSP、工具链在远程。
+One command: downloads a pinned Neovim version (fully isolated from any Neovim you already have), deploys the remote agent over SSH automatically, and opens the remote workspace locally. Buffers are local, so typing has zero latency; files, LSP, and toolchains stay on the remote.
 
-## 设计原则
+## Design principles
 
-- **本地前端 + 远程 workspace 后端**。不走 `--remote-ui`（打字延迟 = 网络 RTT），也不走
-  sshfs（一致性泥潭）。权威文件永远在远程，本地只持有打开文件的 buffer 副本。
-- **锁定运行时**。每个 rnvim 版本钉死一个 Neovim 版本（当前 v0.12.4），client、agent、
-  内置 Lua runtime 作为一个原子单元发版，协议版本精确匹配，没有兼容矩阵。
-- **不迁就存量生态**。workspace 能力（finder、git、LSP 集成）做第一方远程原生实现，
-  而不是给现有插件写兼容 shim。纯 buffer 类插件（surround、textobjects、主题）天然工作，
-  通过用户叠加层加载（`~/.config/rnvim/user/init.lua`）。
+- **Local frontend + remote workspace backend.** Not `--remote-ui` (typing latency = network RTT), and not sshfs (a consistency swamp). The authoritative files always live on the remote; the local side only holds buffer copies of open files.
+- **Locked runtime.** Each rnvim version pins one Neovim version (currently v0.12.4). Client, agent, and the bundled Lua runtime ship as one atomic unit with exact protocol-version matching — no compatibility matrix.
+- **No accommodation of the legacy plugin ecosystem.** Workspace capabilities (finder, git, LSP integration) are first-party remote-native implementations, not compatibility shims for existing plugins. Pure-buffer plugins (surround, textobjects, colorschemes) work naturally and load through the user overlay (`~/.config/rnvim/user/init.lua`).
 
-## 当前状态（MVP：M0 + M1）
+## Current status (MVP: M0 + M1)
 
-- [x] 托管 Neovim：首次运行自动下载锁定版本，`NVIM_APPNAME=rnvim` 隔离启动
-- [x] 内嵌 Lua runtime，随二进制发布，启动时展开
-- [x] SSH 自动部署 agent：同平台推送自身二进制，跨平台从当前版本的 GitHub Release
-  拉取 musl 静态构建推送（本地缓存于 `~/.rnvim/dist/`；因此跨平台部署要求该版本
-  release 已发布——release train 纪律的一部分）
-- [x] 协议握手 + 版本校验（JSON-lines over stdio）
-- [x] 远程文件打开 / 编辑 / 保存（BufReadCmd/BufWriteCmd → agent fs 服务）
-- [x] 远程目录浏览（`<CR>` 进入，`-` 返回上级）
-- [x] 新建远程文件（含自动创建父目录）
-- [x] `local:` 回环模式（无需 sshd 的开发/测试路径）
+- [x] Managed Neovim: pinned version auto-downloaded on first run, launched isolated under `NVIM_APPNAME=rnvim`
+- [x] Bundled Lua runtime, shipped inside the binary, unpacked at startup
+- [x] Automatic agent deploy over SSH: same platform pushes our own binary; cross-platform pulls the musl static build from this version's GitHub Release (cached locally under `~/.rnvim/dist/`; cross-platform deploys therefore require that version's release to be published — part of the release-train discipline)
+- [x] Protocol handshake + version check (JSON lines over stdio)
+- [x] Remote file open / edit / save (BufReadCmd/BufWriteCmd → agent fs service)
+- [x] Remote directory browsing (`<CR>` to enter, `-` to go up)
+- [x] Creating remote files (with automatic parent-directory creation)
+- [x] `local:` loopback mode (development/testing path that needs no sshd)
 
-### 试用
+### Try it
 
 ```bash
 cargo build --release
 
-# 远程会话（需要 ssh 免密登录）
+# Remote session (requires passwordless ssh)
 ./target/release/rnvim dev-box:~/project
 
-# 本地回环（无需远程机器）
+# Local loopback (no remote machine needed)
 ./target/release/rnvim local:/tmp/somedir
 ```
 
-## 架构
+## Architecture
 
 ```
-┌─ 本地 ────────────────────────────┐      ┌─ 远程 ──────────────┐
-│  Neovim v0.12.4 (托管、隔离)       │      │                     │
-│    └─ 内嵌 Lua runtime             │      │  rnvim agent        │
+┌─ local ───────────────────────────┐      ┌─ remote ────────────┐
+│  Neovim v0.12.4 (managed, isolated)│      │                     │
+│    └─ bundled Lua runtime          │      │  rnvim agent        │
 │         │ unix socket (JSON lines) │ ssh  │   fs.read/write/    │
 │  rnvim client (broker)  ───────────┼──────┼─  list/stat/resolve │
-│    版本管理 / agent 部署 / 泵线程   │      │                     │
+│    version mgmt / deploy / pumps   │      │                     │
 └───────────────────────────────────┘      └─────────────────────┘
 ```
 
-- `crates/rnvim-proto` — 协议类型，client/agent 唯一共享真相源
-- `crates/rnvim-agent` — 远程 agent（`rnvim agent --stdio`）
-- `crates/rnvim` — 客户端：CLI、Neovim 版本管理、传输、部署、会话 broker
-- `runtime/` — 内嵌 Neovim Lua runtime（rpc 客户端 + 虚拟文件系统）
+- `crates/rnvim-proto` — protocol types, the single shared source of truth between client and agent
+- `crates/rnvim-agent` — the remote agent (`rnvim agent --stdio`)
+- `crates/rnvim` — the client: CLI, Neovim version management, transport, deploy, session broker
+- `runtime/` — bundled Neovim Lua runtime (rpc client + virtual filesystem)
 
-路径模型：远程绝对路径挂载在本地前缀 `~/.rnvim/ws/<host>/` 之下（前缀映射而非 URL
-scheme），为后续 LSP 代理的 URI 重写做的先手设计——翻译退化为纯前缀替换。
+Path model: remote absolute paths are mounted under the local prefix `~/.rnvim/ws/<host>/` (prefix mapping, not a URL scheme) — a deliberate head start for the LSP proxy's URI rewriting, which degenerates to pure prefix replacement.
 
-## 路线图
+## Roadmap
 
-- [x] **M2**：LSP 支持
-  - `rnvim lsp-proxy`：LSP stdio 代理，Content-Length 帧级 JSON 重写（本地前缀 ↔ 远程路径，
-    双向；反向所需的远程根路径从 `initialize` 请求自动捕获）
-  - 服务器在远程经用户登录 shell 启动（PATH 完整），`exec.which` 探测可用性并按需告警
-  - `fs.findroot`：root markers 在远程文件系统上探测
-  - 内置服务器集：gopls、rust-analyzer、clangd、pyright、ts_ls、lua_ls（第一方配置，
-    不依赖 lspconfig）；LSP 周边插件（补全/diagnostics UI）经 `vim.lsp` 天然兼容
-  - `:RnvimTerm`：远程终端，cd 到当前 buffer 所在目录
-  - 已知限制：字符串中段内嵌的路径不重写（只处理路径边界开头的值）；未处理百分号编码 URI；
-    文件监听暂禁用（随 QUIC 里程碑做远程 watcher）
-- [x] **M3**：工作区导航
-  - `<C-p>` / `:RnvimFiles`：模糊文件跳转——文件遍历（ignore，尊重 .gitignore）和模糊打分
-    （nucleo）全在远程 agent 完成，每次按键只回传 top-N，大仓库不受文件数影响
-  - `<C-g>` / `:RnvimGrep`：实时 grep（ripgrep 引擎按库使用，smart-case，非法正则自动回退
-    字面量搜索），`<C-q>` 全部结果进 quickfix
-  - `:RnvimConnect` + `rnvim` 裸命令选择器：远程目标管理——解析 `~/.ssh/config`（含
-    Include）出 host 列表，`~/.rnvim/recent.json` 记住最近工作区（host + 目录，去重上限
-    50）；编辑器内选中目标即无缝切换会话（handoff + 客户端外层循环）
-  - agent 文件列表带 10s 缓存；20 万文件硬上限防止病态目录拖垮 agent
-- [x] **多工作区路由**：broker 升级为多 agent / 多 nvim 连接路由器（消息带 host 字段路由 +
-  id 重映射；`session.*` 控制方法由 broker 处理）。每个工作区独立注册 LSP 配置
-  （`gopls_<slug>`），零外部依赖
-- [x] **session 侧栏 + picker 集成**：常驻左侧竖栏列出全部 session（编号 + 活动标记，
-  鼠标点击可切换，`Ctrl-\ b` 开关，`Ctrl-\ 1..9` 数字直跳，窄终端自动隐藏）；
-  `:RnvimConnect` 的候选列表顶部显示已打开 session，回车直接切换实例而非重复新建
-- [x] **daemon 化 PTY 宿主（herdr 形态）**：`rnvim daemon` 自动拉起（setsid 脱离终端），
-  持有全部 nvim 实例（每 session 一个 PTY）和共享 agent 路由。客户端 raw-mode 透传，
-  **detach/reattach 会话不死**——关终端重开，buffer/LSP/undo 全在
-  - 前缀键 `Ctrl-\`：`d` detach · `n`/`p` 切换实例 · `s` 会话列表 · `c` 新建 ·
-    `Ctrl-\ Ctrl-\` 发送字面量
-  - 无终端仿真：单实例全屏可见，重绘 = PTY resize + nvim RPC `redraw!`（带超时，
-    模态提示不会卡死控制环）；慢客户端由有界队列保护，绝不冻结 nvim
-  - `:RnvimConnect` 现在开**新实例**（daemon 会话）而非当前编辑器内的 tab
-  - `--headless-cmd` 保留旧直连模式（测试/脚本用，不经 daemon）
-- [x] **连接的目录选择阶段**：`rnvim host`（不带路径）先进入远程目录浏览器
-  （`<CR>` 进入子目录 · `<C-s>` 选定当前目录为 session 根）,选完才正式成为 session；
-  `:RnvimConnect` 选了裸 host 同样先走目录浏览。recent 记录的是选定的项目目录而非 home
-- **M4**：QUIC 传输（0-RTT 重连、漫游）+ SSH stdio 降级、端口转发、git 只读三件套
-- [x] 发布工程：CI（fmt/clippy/test）+ tag 触发四平台构建（含 musl 静态 agent）发布到
-  GitHub Release；客户端按需拉取远程平台的预编译 agent（本地经 `gh` 认证下载、缓存于
-  `~/.rnvim/dist/`、SSH 推送——远程机器无需访问 GitHub）
-- [x] **LSP 依赖远程自动安装（mason-registry 数据源）**：缺服务器时自动装到远程
-  `~/.rnvim/tools/`。分层：agent 只提供通用 `exec.run`（登录 shell、tools 前缀、独立
-  线程执行）——**装什么、怎么装的知识全在客户端**：`rnvim registry script <name>` 从
-  mason-registry 快照（本地缓存，`rnvim registry update` 刷新）解析包规格生成自包含
-  POSIX 脚本，版本由 registry 钉死（不用 latest）；支持 pkg:github/npm/golang 三种
-  来源；用户可用 `vim.g.rnvim_lsp_recipes` 覆盖或新增任意配方。npm/go 走各自生态的
-  完整性校验；github 资产为 TLS + 版本钉死（registry 不含 hash）
-- [x] **用户配置集成（vscode-neovim 式）**：`vim.g.rnvim` 公开契约；
-  `~/.rnvim/config.json` 写 `{"user_config": true}` 显式启用后加载 `~/.config/nvim`
-  （插件数据仍隔离在 rnvim APPNAME 下），用户配置据 `vim.g.rnvim` 走 rnvim 分支
-- 待做：协议快照测试、docker sshd 集成测试、github 资产 hash 校验（等 registry 提供）
+- [x] **M2**: LSP support
+  - `rnvim lsp-proxy`: an LSP stdio proxy doing Content-Length-framed JSON rewriting (local prefix ↔ remote path, both directions; the remote root needed for the reverse direction is captured automatically from the `initialize` request)
+  - Servers start on the remote through the user's login shell (full PATH); `exec.which` probes availability and warns when needed
+  - `fs.findroot`: root markers probed on the remote filesystem
+  - Built-in server set: gopls, rust-analyzer, clangd, pyright, ts_ls, lua_ls (first-party configs, no lspconfig dependency); LSP-adjacent plugins (completion / diagnostics UI) work naturally through `vim.lsp`
+  - `:RnvimTerm`: remote terminal, cd'd to the current buffer's directory
+  - Known limits: paths embedded mid-string are not rewritten (only values starting at a path boundary); percent-encoded URIs unhandled; file watching disabled for now (remote watcher comes with the QUIC milestone)
+- [x] **M3**: workspace navigation
+  - `<C-p>` / `:RnvimFiles`: fuzzy file jumping — file walking (ignore, respects .gitignore) and fuzzy scoring (nucleo) all run on the remote agent; only the top N results cross the wire per keystroke, so huge repos don't suffer from file count
+  - `<C-g>` / `:RnvimGrep`: live grep (ripgrep engine used as a library, smart-case, invalid regexes fall back to literal search); `<C-q>` sends all results to quickfix
+  - `:RnvimConnect` + the bare `rnvim` picker: remote target management — parses `~/.ssh/config` (with Include) into a host list; `~/.rnvim/recent.json` remembers recent workspaces (host + directory, deduped, capped at 50); selecting a target inside the editor hands the session over seamlessly (handoff + client outer loop)
+  - Agent file listings carry a 10s cache; a hard cap of 200k files keeps pathological directories from dragging the agent down
+- [x] **Multi-workspace routing**: the broker is a router across any number of agents and nvim connections (messages routed by a host field + id remapping; `session.*` control methods handled by the broker itself). Each workspace registers its own LSP configs (`gopls_<slug>`), zero external dependencies
+- [x] **Session sidebar + picker integration**: a persistent left rail lists every session (numbered, active marker, mouse-clickable, `Ctrl-\ b` toggles, `Ctrl-\ 1..9` jumps by number, auto-hides on narrow terminals); `:RnvimConnect`'s candidate list shows open sessions at the top — Enter switches to the instance instead of creating a duplicate
+- [x] **Daemonized PTY host (herdr-shaped)**: `rnvim daemon` starts automatically (setsid, detached from the terminal) and owns every nvim instance (one PTY per session) plus the shared agent router. The client is a raw-mode passthrough; **detach/reattach keeps sessions alive** — close the terminal, reopen, and buffers/LSP/undo are all still there
+  - Prefix key `Ctrl-\`: `d` detach · `n`/`p` cycle instances · `s` session list · `c` new session · `Ctrl-\ Ctrl-\` sends the literal key
+  - Rendering is painted from a per-session virtual screen (vt100), with row-level diffs and native scroll ops; slow clients are protected by coalescing and can never freeze nvim
+  - `:RnvimConnect` now opens a **new instance** (daemon session) instead of a tab inside the current editor
+  - `--headless-cmd` keeps the legacy direct mode (for tests/scripting, bypasses the daemon)
+- [x] **Directory-selection stage on connect**: `rnvim host` (no path) first enters a remote directory browser (`<CR>` descends · `<C-s>` picks the current directory as the session root); only then does it become a session. Picking a bare host in `:RnvimConnect` goes through the same browsing stage. Recents record the chosen project directory, not the home dir
+- **M4**: QUIC transport (0-RTT reconnect, roaming) + SSH stdio fallback, port forwarding, read-only git trio
+- [x] Release engineering: CI (fmt/clippy/test) + tag-triggered four-platform builds (including the musl static agent) published to GitHub Releases; the client pulls the prebuilt agent for the remote platform on demand (downloaded locally via `gh` auth, cached under `~/.rnvim/dist/`, pushed over SSH — the remote machine never needs GitHub access)
+- [x] **Automatic remote LSP install (mason-registry data source)**: missing servers are installed on the remote under `~/.rnvim/tools/`. Layering: the agent only provides a generic `exec.run` (login shell, tools prefix, runs on its own thread) — **what to install and how lives entirely in the client**: `rnvim registry script <name>` resolves the package spec from a mason-registry snapshot (cached locally, refreshed with `rnvim registry update`) into a self-contained POSIX script, with versions pinned by the registry (never `latest`); supports pkg:github/npm/golang sources; users can override or add any recipe via `vim.g.rnvim_lsp_recipes`. npm/go go through their ecosystems' own integrity checks; GitHub assets are TLS + version-pinned (the registry carries no hashes)
+- [x] **User config integration (vscode-neovim style)**: `vim.g.rnvim` is the public contract; writing `{"user_config": true}` to `~/.rnvim/config.json` explicitly opts in to loading `~/.config/nvim` (plugin data stays isolated under the rnvim APPNAME); user configs branch on `vim.g.rnvim`
+- To do: protocol snapshot tests, docker sshd integration tests, hash verification for GitHub assets (once the registry provides them)
