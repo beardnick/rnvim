@@ -6,7 +6,7 @@ on:
   pull_request:
 
 jobs:
-  test:
+  rust:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -17,3 +17,24 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+
+  plugin:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Neovim
+        uses: rhysd/action-setup-vim@v1
+        with:
+          neovim: true
+          version: stable
+      - name: Lua unit tests
+        run: nvim --headless --clean --cmd "set rtp+=." -l tests/unit_spec.lua
+      - name: Build agent
+        run: cargo build -p rnvim-agent
+      - name: Loopback e2e
+        run: |
+          E2E_HOME=$(mktemp -d)
+          HOME="$E2E_HOME" RNVIM_AGENT_BIN="$PWD/target/debug/rnvim-agent" \
+            nvim --headless --clean --cmd "set rtp+=." -l tests/e2e.lua

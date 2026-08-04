@@ -1,14 +1,15 @@
--- fzf-style picker: fuzzy file finding and live grep over the current
--- workspace (matching runs on that workspace's remote agent), plus the
--- connect switcher that opens additional workspaces in new tabs.
+-- fzf-style picker.
 --
---   <C-p> / :RnvimFiles     fuzzy file jump (current workspace)
---   <C-g> / :RnvimGrep      live grep (current workspace)
---   :RnvimConnect           open another remote target in a new tab
---   <CR> open  <C-n>/<C-p>/<Up>/<Down> move  <C-q> → quickfix  <Esc> close
-
-local rpc = require("rnvim.rpc")
-local workspaces = require("rnvim.workspaces")
+-- In a remote instance (vim.g.rnvim set):
+--   <C-p> / :RnvimFiles     fuzzy file jump (matching runs on the agent)
+--   <C-g> / :RnvimGrep      live grep
+--   browse mode             directory-selection stage for a bare-host
+--                           connect (<CR> descend · <C-s> pick as root)
+--
+-- Everywhere (local instances too):
+--   :RnvimConnect           pick a target; open sessions switch via the
+--                           multiplexer driver, new targets spawn a fresh
+--                           instance in a new window
 
 local M = {}
 local state
@@ -70,14 +71,13 @@ local function clear_query()
   pcall(vim.api.nvim_win_set_cursor, state.prompt_win, { 1, #state.prompt_prefix })
 end
 
---- Fetch a remote directory for browse mode (agent connected lazily by the
---- broker on first call — this is the connect flow's directory stage).
+--- Fetch a remote directory for browse mode (remote instance only —
+--- this is the directory-selection stage before the workspace roots).
 local function fetch_browse(path)
   if not state then
     return
   end
-  local host = state.browse_host
-  rpc.request_async(nil, "session.browse", { host = host, path = path }, function(err, res)
+  require("rnvim.rpc").request_async("fs.resolve", { path = path }, function(err, res)
     if not state or state.mode ~= "browse" then
       return
     end
@@ -85,11 +85,20 @@ local function fetch_browse(path)
       vim.notify("[rnvim] browse failed: " .. err, vim.log.levels.ERROR)
       return
     end
-    state.browse_path = res.abs
-    state.browse_entries = res.entries or {}
-    retitle((" rnvim browse %s:%s · <CR> enter · <C-s> choose this dir "):format(host, res.abs))
-    clear_query()
-    require("rnvim.picker")._research()
+    require("rnvim.rpc").request_async("fs.list", { path = res.abs }, function(lerr, lres)
+      if not state or state.mode ~= "browse" then
+        return
+      end
+      if lerr then
+        vim.notify("[rnvim] browse failed: " .. lerr, vim.log.levels.ERROR)
+        return
+      end
+      state.browse_path = res.abs
+      state.browse_entries = lres.entries or {}
+      retitle((" rnvim browse %s:%s · <CR> enter · <C-s> choose this dir "):format(state.browse_host, res.abs))
+      clear_query()
+      M._research()
+    end)
   end)
 end
 
@@ -134,38 +143,33 @@ local function search(query)
     return
   end
   local method = state.mode == "files" and "find.files" or "find.grep"
-  rpc.request_async(
-    state.ws.host,
-    method,
-    { root = state.root, query = query, limit = 100 },
-    function(err, res)
-      if not state or gen ~= state.gen then
-        return
-      end
-      if err then
-        vim.notify("[rnvim] search failed: " .. err, vim.log.levels.ERROR)
-        return
-      end
-      local items = {}
-      if state.mode == "files" then
-        for _, f in ipairs(res.files or {}) do
-          items[#items + 1] = { display = f, path = f }
-        end
-      else
-        for _, m in ipairs(res.matches or {}) do
-          items[#items + 1] = {
-            display = ("%s:%d: %s"):format(m.path, m.line, m.text),
-            path = m.path,
-            line = m.line,
-            col = m.col,
-          }
-        end
-      end
-      state.items = items
-      state.selected = 1
-      render()
+  require("rnvim.rpc").request_async(method, { root = state.root, query = query, limit = 100 }, function(err, res)
+    if not state or gen ~= state.gen then
+      return
     end
-  )
+    if err then
+      vim.notify("[rnvim] search failed: " .. err, vim.log.levels.ERROR)
+      return
+    end
+    local items = {}
+    if state.mode == "files" then
+      for _, f in ipairs(res.files or {}) do
+        items[#items + 1] = { display = f, path = f }
+      end
+    else
+      for _, m in ipairs(res.matches or {}) do
+        items[#items + 1] = {
+          display = ("%s:%d: %s"):format(m.path, m.line, m.text),
+          path = m.path,
+          line = m.line,
+          col = m.col,
+        }
+      end
+    end
+    state.items = items
+    state.selected = 1
+    render()
+  end)
 end
 
 local function current_query()
@@ -184,14 +188,30 @@ local function target_path(item)
   return state.ws.ws_root .. state.root .. "/" .. item.path
 end
 
---- Open `info` (a session.connect result) as a workspace in a new tab.
-local function open_workspace(info)
-  local ws = workspaces.register(info)
-  require("rnvim.lsp").register_workspace(ws)
-  workspaces.last_active = ws
-  vim.cmd.tabnew()
-  vim.t.rnvim_ws = ws.slug
-  vim.cmd.edit(vim.fn.fnameescape(ws.ws_root .. info.abs:gsub("/+$", "")))
+--- Open (or switch to) `target`. Open session → driver focus; new target
+--- → driver spawn. `host` with no path spawns straight away — the new
+--- instance runs the directory-selection stage itself.
+local function open_target(target)
+  local sessions = require("rnvim.sessions")
+  local drivers = require("rnvim.drivers")
+  local util = require("rnvim.util")
+
+  local existing = sessions.find(target)
+  if existing then
+    local ok, err = drivers.get().focus(existing.handle)
+    if not ok then
+      vim.notify("[rnvim] " .. (err or "cannot switch"), vim.log.levels.WARN)
+    end
+    return
+  end
+
+  local slug = util.host_slug(util.parse_target(target).host)
+  local handle, err = drivers.get().spawn(slug, target)
+  if err then
+    vim.notify("[rnvim] " .. err, vim.log.levels.WARN)
+  elseif handle ~= nil then
+    vim.notify("[rnvim] opened " .. target)
+  end
 end
 
 local function accept()
@@ -217,37 +237,9 @@ local function accept()
   end
 
   if state.mode == "connect" then
-    if item.focus_id then
-      -- An already-open session: switch the daemon's focus to it.
-      close()
-      rpc.request_async(nil, "session.focus", { id = item.focus_id }, function(err)
-        if err then
-          vim.notify("[rnvim] switch failed: " .. err, vim.log.levels.ERROR)
-        end
-      end)
-      return
-    end
     local target = item.target
-    if not target:find(":", 1, true) then
-      -- Host without a path: enter the directory-selection stage before
-      -- anything becomes a session.
-      close()
-      M.open_browse(target, "connect")
-      return
-    end
     close()
-    vim.notify("[rnvim] connecting to " .. target .. "...")
-    rpc.request_async(nil, "session.connect", { target = target }, function(err, info)
-      if err then
-        vim.notify("[rnvim] connect failed: " .. err, vim.log.levels.ERROR)
-        return
-      end
-      if info.instance then
-        vim.notify(("[rnvim] opened %s in a new session"):format(info.title or target))
-      else
-        open_workspace(info) -- legacy direct mode: in-editor tab
-      end
-    end)
+    open_target(target)
     return
   end
 
@@ -277,61 +269,36 @@ local function to_quickfix()
   vim.cmd.copen()
 end
 
---- <C-s> in browse mode: the currently browsed directory becomes the root.
+--- <C-s> in browse mode: the browsed directory becomes this instance's
+--- workspace root.
 local function choose_dir()
   if not state or state.mode ~= "browse" then
     return
   end
-  local host, path, purpose = state.browse_host, state.browse_path, state.browse_purpose
+  local path = state.browse_path
   if not path then
     return
   end
+  local on_rooted = state.browse_on_rooted
   close()
-
-  if purpose == "connect" then
-    local target = host .. ":" .. path
-    vim.notify("[rnvim] connecting to " .. target .. "...")
-    rpc.request_async(nil, "session.connect", { target = target }, function(err, info)
-      if err then
-        vim.notify("[rnvim] connect failed: " .. err, vim.log.levels.ERROR)
-        return
-      end
-      if info.instance then
-        vim.notify(("[rnvim] opened %s in a new session"):format(info.title or target))
-      else
-        open_workspace(info)
-      end
-    end)
-    return
-  end
-
-  -- purpose == "root": this instance adopts the directory as its session
-  -- root (records it as recent, retitles the daemon session).
-  rpc.request_async(nil, "session.rooted", {
-    host = host,
-    path = path,
-    instance = tonumber(vim.env.RNVIM_INSTANCE),
-  }, function() end)
-  local ws = workspaces.by_host[host]
-  if ws then
-    ws.entry = path
-    ws.project_root = nil
-    vim.cmd.edit(vim.fn.fnameescape(ws.ws_root .. path:gsub("/+$", "")))
+  if on_rooted then
+    on_rooted(path)
   end
 end
 
---- Project root on the workspace's remote: nearest .git above its entry,
+--- Project root on the workspace host: nearest .git above its entry,
 --- falling back to the entry directory. Cached on the workspace.
 local function project_root(ws)
   if ws.project_root then
     return ws.project_root
   end
+  local rpc = require("rnvim.rpc")
   local entry = ws.entry or "/"
-  local ok, res = pcall(rpc.request, ws.host, "fs.findroot", { path = entry, markers = { ".git" } })
+  local ok, res = pcall(rpc.request, "fs.findroot", { path = entry, markers = { ".git" } })
   if ok and res.root and res.root ~= vim.NIL then
     ws.project_root = res.root
   else
-    local ok_stat, st = pcall(rpc.request, ws.host, "fs.stat", { path = entry })
+    local ok_stat, st = pcall(rpc.request, "fs.stat", { path = entry })
     if ok_stat and st.kind == "dir" then
       ws.project_root = entry
     else
@@ -341,29 +308,26 @@ local function project_root(ws)
   return ws.project_root
 end
 
---- Load connect candidates: recent workspaces first, then ssh hosts.
+--- Connect candidates: open sessions first, then recents, then ssh hosts.
 local function connect_items()
-  local path = M.connect_cfg and M.connect_cfg.targets
-  if not path or path == "" or not vim.uv.fs_stat(path) then
-    return {}
-  end
-  local ok, data = pcall(vim.json.decode, table.concat(vim.fn.readfile(path), "\n"))
-  if not ok or type(data) ~= "table" then
-    return {}
-  end
   local items = {}
-  for _, s in ipairs(data.open or {}) do
-    items[#items + 1] = {
-      display = ("%s %s  [open]"):format(s.active and "●" or "○", s.title),
-      focus_id = s.id,
-    }
+  local me = vim.uv.os_getpid()
+  for _, s in ipairs(require("rnvim.sessions").list()) do
+    if s.pid ~= me then
+      items[#items + 1] = { display = ("● %s  [open]"):format(s.target), target = s.target }
+    end
   end
-  for _, e in ipairs(data.recent or {}) do
+  local remotes = require("rnvim.remotes")
+  local seen_host = {}
+  for _, e in ipairs(remotes.load_recent()) do
     local target = ("%s:%s"):format(e.host, e.path)
     items[#items + 1] = { display = target, target = target }
+    seen_host[e.host] = true
   end
-  for _, h in ipairs(data.hosts or {}) do
-    items[#items + 1] = { display = h, target = h }
+  for _, h in ipairs(remotes.ssh_hosts()) do
+    if not seen_host[h] then
+      items[#items + 1] = { display = h, target = h }
+    end
   end
   return items
 end
@@ -375,9 +339,9 @@ function M.open(mode)
 
   local ws, root
   if mode ~= "connect" and mode ~= "browse" then
-    ws = workspaces.current()
+    ws = require("rnvim.workspace").current()
     if not ws then
-      vim.notify("[rnvim] no active workspace — :RnvimConnect first", vim.log.levels.WARN)
+      vim.notify("[rnvim] this instance has no workspace — :RnvimConnect opens one", vim.log.levels.WARN)
       return
     end
     root = project_root(ws)
@@ -484,15 +448,15 @@ function M.open(mode)
   end
 end
 
---- Directory-selection stage: browse `host` and pick a directory.
---- purpose "connect" → new session there; "root" → re-root this instance.
-function M.open_browse(host, purpose)
+--- Directory-selection stage (remote instance, bare-host connect): browse
+--- the host and pick a directory; `on_rooted(path)` adopts it.
+function M.open_browse(host, on_rooted)
   M.open("browse")
   if not state then
     return
   end
   state.browse_host = host
-  state.browse_purpose = purpose
+  state.browse_on_rooted = on_rooted
   fetch_browse("~")
 end
 
@@ -503,26 +467,28 @@ function M._research()
   end
 end
 
---- Workspace pickers + the connect switcher.
+--- Commands available everywhere; workspace pickers only bind where a
+--- workspace exists.
 function M.setup(opts)
-  M.connect_cfg = { targets = opts.targets }
-
-  vim.api.nvim_create_user_command("RnvimFiles", function()
-    M.open("files")
-  end, { desc = "rnvim: fuzzy find files" })
-  vim.api.nvim_create_user_command("RnvimGrep", function()
-    M.open("grep")
-  end, { desc = "rnvim: live grep" })
   vim.api.nvim_create_user_command("RnvimConnect", function()
     M.open("connect")
-  end, { desc = "rnvim: open a remote target in a new tab" })
+  end, { desc = "rnvim: open or switch to a remote workspace" })
 
-  vim.keymap.set("n", "<C-p>", function()
-    M.open("files")
-  end, { desc = "rnvim: fuzzy find files" })
-  vim.keymap.set("n", "<C-g>", function()
-    M.open("grep")
-  end, { desc = "rnvim: live grep" })
+  if opts and opts.workspace then
+    vim.api.nvim_create_user_command("RnvimFiles", function()
+      M.open("files")
+    end, { desc = "rnvim: fuzzy find files" })
+    vim.api.nvim_create_user_command("RnvimGrep", function()
+      M.open("grep")
+    end, { desc = "rnvim: live grep" })
+
+    vim.keymap.set("n", "<C-p>", function()
+      M.open("files")
+    end, { desc = "rnvim: fuzzy find files" })
+    vim.keymap.set("n", "<C-g>", function()
+      M.open("grep")
+    end, { desc = "rnvim: live grep" })
+  end
 end
 
 return M

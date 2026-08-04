@@ -1,9 +1,11 @@
--- First-party LSP integration, multi-workspace: each connected workspace
--- registers its own copies of the server configs (name-suffixed by slug),
--- every server runs on that workspace's host behind `rnvim lsp-proxy`.
+-- First-party LSP integration: every server runs on the workspace host
+-- through the pure-Lua rewriting transport (lsp_transport). Configs are
+-- registered under `<name>_rnvim` so a user config loaded alongside can
+-- still define the standard names for local use; anything the user
+-- registered under the standard name flows into the rnvim variant.
 
 local rpc = require("rnvim.rpc")
-local workspaces = require("rnvim.workspaces")
+local workspace = require("rnvim.workspace")
 
 local M = {}
 
@@ -40,39 +42,31 @@ local servers = {
   },
 }
 
-local rnvim_bin
 local which_cache = {}
-local warned = {}
-
-local recipes = require("rnvim.recipes")
 local installing = {}
 
 local function is_null(v)
   return v == nil or v == vim.NIL
 end
 
---- Install a missing server on the remote. A user recipe (full-control
---- script) runs directly via exec.run; otherwise the broker's
---- session.install orchestrates: registry plan resolved locally, artifact
+--- Install a missing server on the workspace host. A user recipe (full-
+--- control script) runs directly via exec.run; otherwise the registry
+--- module orchestrates: mason-registry plan resolved locally, artifact
 --- fetched by the agent's native HTTP client on the remote, then unpacked
---- by a network-free script. One attempt per host+binary; attach is
---- re-triggered on success.
+--- by a network-free script. One attempt per binary; attach is re-
+--- triggered on success.
 local function try_install(bin, host, bufnr)
-  local key = host .. ":" .. bin
-  if installing[key] then
+  if installing[bin] then
     return
   end
-  installing[key] = true
+  installing[bin] = true
 
   local function finish(err, path)
     if err then
-      vim.notify(
-        ("[rnvim] could not install %s on %s: %s"):format(bin, host, err),
-        vim.log.levels.WARN
-      )
+      vim.notify(("[rnvim] could not install %s on %s: %s"):format(bin, host, err), vim.log.levels.WARN)
       return
     end
-    which_cache[key] = true
+    which_cache[bin] = true
     vim.notify(("[rnvim] %s installed on %s (%s)"):format(bin, host, path or "?"))
     if bufnr and vim.api.nvim_buf_is_valid(bufnr) then
       -- Re-run the FileType machinery so vim.lsp.enable attaches now.
@@ -81,9 +75,9 @@ local function try_install(bin, host, bufnr)
   end
 
   vim.notify(("[rnvim] installing %s on %s (first use)..."):format(bin, host))
-  local user_script = recipes.user_script(bin)
+  local user_script = require("rnvim.recipes").user_script(bin)
   if user_script then
-    rpc.request_async(host, "exec.run", { script = user_script }, function(err, res)
+    rpc.request_async("exec.run", { script = user_script }, function(err, res)
       if err or res.code ~= 0 then
         finish(err or (res.stderr:match("([^\n]+)%s*$") or ("exit " .. res.code)))
       else
@@ -93,49 +87,36 @@ local function try_install(bin, host, bufnr)
     return
   end
 
-  rpc.request_async(nil, "session.install", { host = host, name = bin }, function(err, res)
-    if err then
-      finish(err)
-    else
-      finish(nil, res.path)
-    end
-  end)
+  require("rnvim.registry").install(bin, finish)
 end
 
 local function server_available(bin, host, bufnr)
-  local key = host .. ":" .. bin
-  if which_cache[key] == nil then
-    local ok, res = pcall(rpc.request, host, "exec.which", { name = bin })
-    which_cache[key] = ok and not is_null(res.path)
+  if which_cache[bin] == nil then
+    local ok, res = pcall(rpc.request, "exec.which", { name = bin })
+    which_cache[bin] = ok and not is_null(res.path)
   end
-  if not which_cache[key] then
+  if not which_cache[bin] then
     try_install(bin, host, bufnr)
   end
-  return which_cache[key]
+  return which_cache[bin]
 end
 
---- Register + enable the server set for one workspace.
+--- Register + enable the server set for the instance's workspace.
 function M.register_workspace(ws)
   if ws.lsp_registered then
     return
   end
   ws.lsp_registered = true
-  if not rnvim_bin or rnvim_bin == "" then
-    vim.notify("[rnvim] RNVIM_BIN not set; LSP disabled", vim.log.levels.WARN)
-    return
-  end
 
-  local suffix = ws.slug:gsub("[^%w_]", "_")
+  local transport = require("rnvim.lsp_transport")
   local names = {}
   for name, def in pairs(servers) do
-    local proxy_cmd = { rnvim_bin, "lsp-proxy", "--host", ws.host, "--ws-root", ws.ws_root, "--" }
-    vim.list_extend(proxy_cmd, def.cmd)
-    local cfg_name = ("%s_%s"):format(name, suffix)
+    local cfg_name = name .. "_rnvim"
     names[#names + 1] = cfg_name
 
     -- Anything the user registered under the STANDARD server name — via
     -- vim.lsp.config("gopls", { settings = ... }) or an lsp/gopls.lua on
-    -- their rtp — flows into the proxied variant: settings, handlers,
+    -- their rtp — flows into the rnvim variant: settings, handlers,
     -- init_options... cmd/root_dir/capabilities stay rnvim's.
     local ok_base, user_base = pcall(function()
       return vim.lsp.config[name]
@@ -150,20 +131,19 @@ function M.register_workspace(ws)
     end
 
     vim.lsp.config(cfg_name, {
-      cmd = proxy_cmd,
+      cmd = transport.cmd(ws.host, ws.ws_root, def.cmd),
       filetypes = def.filetypes,
       root_dir = function(bufnr, on_dir)
         local file = vim.api.nvim_buf_get_name(bufnr)
-        if workspaces.of_file(file) ~= ws then
-          return -- another workspace's copy will pick this buffer up
+        if not workspace.of_file(file) then
+          return -- a local buffer in a remote instance: leave it alone
         end
         if not server_available(def.cmd[1], ws.host, bufnr) then
           return
         end
-        local remote = workspaces.remote_path(file, ws)
+        local remote = workspace.remote_path(file)
         local root
-        local ok, res =
-          pcall(rpc.request, ws.host, "fs.findroot", { path = remote, markers = def.markers })
+        local ok, res = pcall(rpc.request, "fs.findroot", { path = remote, markers = def.markers })
         if ok and not is_null(res.root) then
           root = res.root
         else
@@ -193,9 +173,7 @@ function M.register_workspace(ws)
   vim.lsp.enable(names)
 end
 
-function M.setup(opts)
-  rnvim_bin = opts.rnvim_bin
-
+function M.setup()
   -- Definition-jump keymaps nvim does not ship by default (gd is the old
   -- "local declaration" motion). grr/gri/grn/gra/K/CTRL-] are built-ins.
   vim.api.nvim_create_autocmd("LspAttach", {
