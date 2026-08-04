@@ -19,6 +19,21 @@ local servers = {
     cmd = { "rust-analyzer" },
     filetypes = { "rust" },
     markers = { "Cargo.toml", ".git" },
+    -- rust-analyzer only emits Run/Debug code lenses when the client
+    -- declares it can execute their client-side commands (locally
+    -- nvim-lspconfig declares this; rnvim configs are first-party).
+    capabilities = {
+      experimental = {
+        serverStatusNotification = true,
+        commands = {
+          commands = {
+            "rust-analyzer.showReferences",
+            "rust-analyzer.runSingle",
+            "rust-analyzer.debugSingle",
+          },
+        },
+      },
+    },
   },
   clangd = {
     cmd = { "clangd" },
@@ -161,6 +176,14 @@ function M.register_workspace(ws)
         local ok, blink = pcall(require, "blink.cmp")
         if ok and blink.get_lsp_capabilities then
           caps = blink.get_lsp_capabilities(caps)
+        end
+        -- capabilities the user registered under the standard name, then
+        -- rnvim's per-server extras (e.g. rust-analyzer lens commands)
+        if ok_base and type(user_base) == "table" and type(user_base.capabilities) == "table" then
+          caps = vim.tbl_deep_extend("force", caps, user_base.capabilities)
+        end
+        if def.capabilities then
+          caps = vim.tbl_deep_extend("force", caps, def.capabilities)
         end
         return vim.tbl_deep_extend("force", caps, {
           workspace = {
