@@ -38,9 +38,21 @@ impl AgentConn {
     }
 
     /// Remote agent over ssh. `remote_cmd` is produced by deploy::ensure_remote_agent.
+    /// Keepalives make ssh exit (→ reader EOF → agent eviction → redial)
+    /// within ~90s of the peer silently vanishing, instead of a stale pipe
+    /// lingering until a NAT/firewall finally resets it.
     pub fn spawn_ssh(host: &str, remote_cmd: &str) -> Result<AgentConn> {
         let mut cmd = Command::new("ssh");
-        cmd.args(["-o", "BatchMode=yes", host, remote_cmd]);
+        cmd.args([
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ServerAliveInterval=30",
+            "-o",
+            "ServerAliveCountMax=3",
+            host,
+            remote_cmd,
+        ]);
         Self::from_command(cmd, "ssh agent")
     }
 }

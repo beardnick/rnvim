@@ -39,6 +39,7 @@ const INTERNAL_ID_BASE: u64 = 1 << 62;
 const FWD_ID_BASE: u64 = 1 << 61;
 
 struct Agent {
+    host: String,
     stdin: Mutex<ChildStdin>,
 }
 
@@ -57,11 +58,13 @@ type FocusHook = Box<dyn Fn(u64) + Send + Sync>;
 pub struct Router {
     ws_base: PathBuf,
     agents: Mutex<HashMap<String, Arc<Agent>>>,
-    pending: Mutex<HashMap<u64, mpsc::Sender<Response>>>,
+    /// Broker-internal waiters, tagged with the host they're waiting on so
+    /// they can be failed fast when that agent's connection dies.
+    pending: Mutex<HashMap<u64, (String, mpsc::Sender<Response>)>>,
     next_internal_id: AtomicU64,
     conns: Mutex<HashMap<u64, UnixStream>>,
     next_conn_id: AtomicU64,
-    fwd: Mutex<HashMap<u64, (u64, u64)>>, // fwd_id → (conn_id, original id)
+    fwd: Mutex<HashMap<u64, (u64, u64, String)>>, // fwd_id → (conn_id, original id, host)
     next_fwd_id: AtomicU64,
     /// Daemon override for session.connect (open a new instance). Without
     /// it, connect answers with workspace info for the in-editor flow.
@@ -109,9 +112,69 @@ impl Router {
         }
     }
 
+    /// Drop a dead agent connection so the next use of its host redials
+    /// (deploy + ssh + handshake) instead of failing forever on a stale
+    /// pipe. Everything still waiting on that agent is failed immediately —
+    /// broker-internal waiters get an error response, forwarded nvim
+    /// requests get an error back on their own connection.
+    fn evict_agent(&self, agent: &Arc<Agent>) {
+        let lost = |id| {
+            Response::err(
+                id,
+                ERR_IO,
+                format!("agent connection to {} lost", agent.host),
+            )
+        };
+        {
+            let mut agents = self.agents.lock().unwrap();
+            // only evict ourselves — a fresh redial may already be installed
+            if agents
+                .get(&agent.host)
+                .is_some_and(|cur| Arc::ptr_eq(cur, agent))
+            {
+                agents.remove(&agent.host);
+            }
+        }
+        let waiters: Vec<(u64, mpsc::Sender<Response>)> = {
+            let mut pending = self.pending.lock().unwrap();
+            let ids: Vec<u64> = pending
+                .iter()
+                .filter(|(_, (host, _))| *host == agent.host)
+                .map(|(&id, _)| id)
+                .collect();
+            ids.into_iter()
+                .filter_map(|id| pending.remove(&id).map(|(_, tx)| (id, tx)))
+                .collect()
+        };
+        for (id, tx) in waiters {
+            let _ = tx.send(lost(id));
+        }
+        let forwarded: Vec<(u64, u64)> = {
+            let mut fwd = self.fwd.lock().unwrap();
+            let ids: Vec<u64> = fwd
+                .iter()
+                .filter(|(_, (_, _, host))| *host == agent.host)
+                .map(|(&id, _)| id)
+                .collect();
+            ids.into_iter()
+                .filter_map(|id| {
+                    fwd.remove(&id)
+                        .map(|(conn_id, orig_id, _)| (conn_id, orig_id))
+                })
+                .collect()
+        };
+        for (conn_id, orig_id) in forwarded {
+            if let Ok(line) = serde_json::to_string(&lost(orig_id)) {
+                self.write_conn(conn_id, &line);
+            }
+        }
+    }
+
     /// One reader per agent: broker-internal replies go to their waiters,
     /// forwarded-id replies are rewritten and returned to the right nvim.
-    fn spawn_agent_reader(self: &Arc<Self>, stdout: BufReader<ChildStdout>) {
+    /// EOF means the agent (or its ssh carrier) died — evict it so the
+    /// host can reconnect.
+    fn spawn_agent_reader(self: &Arc<Self>, agent: Arc<Agent>, stdout: BufReader<ChildStdout>) {
         let router = Arc::clone(self);
         thread::spawn(move || {
             let mut stdout = stdout;
@@ -132,7 +195,7 @@ impl Router {
                             continue;
                         };
                         if id >= INTERNAL_ID_BASE {
-                            if let Some(tx) = router.pending.lock().unwrap().remove(&id) {
+                            if let Some((_, tx)) = router.pending.lock().unwrap().remove(&id) {
                                 if let Ok(resp) = serde_json::from_str::<Response>(trimmed) {
                                     let _ = tx.send(resp);
                                 }
@@ -140,7 +203,8 @@ impl Router {
                             continue;
                         }
                         if id >= FWD_ID_BASE {
-                            if let Some((conn_id, orig_id)) = router.fwd.lock().unwrap().remove(&id)
+                            if let Some((conn_id, orig_id, _)) =
+                                router.fwd.lock().unwrap().remove(&id)
                             {
                                 msg["id"] = json!(orig_id);
                                 if let Ok(out) = serde_json::to_string(&msg) {
@@ -151,25 +215,29 @@ impl Router {
                     }
                 }
             }
+            router.evict_agent(&agent);
         });
     }
 
     /// Blocking request from the broker itself to an agent.
-    fn agent_request(&self, agent: &Agent, method: &str, params: Value) -> Result<Value> {
+    fn agent_request(&self, agent: &Arc<Agent>, method: &str, params: Value) -> Result<Value> {
         self.agent_request_timeout(agent, method, params, Duration::from_secs(120))
     }
 
     fn agent_request_timeout(
         &self,
-        agent: &Agent,
+        agent: &Arc<Agent>,
         method: &str,
         params: Value,
         timeout: Duration,
     ) -> Result<Value> {
         let id = self.next_internal_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = mpsc::channel();
-        self.pending.lock().unwrap().insert(id, tx);
-        {
+        self.pending
+            .lock()
+            .unwrap()
+            .insert(id, (agent.host.clone(), tx));
+        let written = {
             let mut stdin = agent.stdin.lock().unwrap();
             let mut line = serde_json::to_string(&Request {
                 id,
@@ -177,8 +245,19 @@ impl Router {
                 params,
             })?;
             line.push('\n');
-            stdin.write_all(line.as_bytes()).context("write to agent")?;
-            stdin.flush()?;
+            stdin
+                .write_all(line.as_bytes())
+                .and_then(|()| stdin.flush())
+        };
+        if let Err(e) = written {
+            // dead pipe: drop the cached connection so the next attempt
+            // redials instead of hitting the same corpse forever
+            self.pending.lock().unwrap().remove(&id);
+            self.evict_agent(agent);
+            return Err(anyhow!(e).context(format!(
+                "agent connection to {} lost (will redial)",
+                agent.host
+            )));
         }
         let resp = rx.recv_timeout(timeout).map_err(|_| {
             self.pending.lock().unwrap().remove(&id);
@@ -203,9 +282,10 @@ impl Router {
             AgentConn::spawn_ssh(&target.host, &remote_cmd)?
         };
         let agent = Arc::new(Agent {
+            host: target.host.clone(),
             stdin: Mutex::new(conn.stdin),
         });
-        self.spawn_agent_reader(conn.stdout);
+        self.spawn_agent_reader(Arc::clone(&agent), conn.stdout);
         // conn.child intentionally dropped unkilled: the agent exits on its
         // own when this process (and thus its stdin pipe) goes away.
 
@@ -437,13 +517,23 @@ impl Router {
             match agent {
                 Some(agent) => {
                     let fwd_id = self.next_fwd_id.fetch_add(1, Ordering::SeqCst);
-                    self.fwd.lock().unwrap().insert(fwd_id, (conn_id, id));
+                    self.fwd
+                        .lock()
+                        .unwrap()
+                        .insert(fwd_id, (conn_id, id, host.clone()));
                     msg["id"] = json!(fwd_id);
-                    if let Ok(out) = serde_json::to_string(&msg) {
-                        let mut stdin = agent.stdin.lock().unwrap();
-                        let _ = stdin.write_all(out.as_bytes());
-                        let _ = stdin.write_all(b"\n");
-                        let _ = stdin.flush();
+                    let written = serde_json::to_string(&msg)
+                        .map_err(std::io::Error::other)
+                        .and_then(|out| {
+                            let mut stdin = agent.stdin.lock().unwrap();
+                            stdin
+                                .write_all(out.as_bytes())
+                                .and_then(|()| stdin.write_all(b"\n"))
+                                .and_then(|()| stdin.flush())
+                        });
+                    if written.is_err() {
+                        // evicting fails this fwd entry back to nvim too
+                        self.evict_agent(&agent);
                     }
                 }
                 None => {
@@ -457,7 +547,10 @@ impl Router {
         }
 
         self.conns.lock().unwrap().remove(&conn_id);
-        self.fwd.lock().unwrap().retain(|_, (c, _)| *c != conn_id);
+        self.fwd
+            .lock()
+            .unwrap()
+            .retain(|_, (c, _, _)| *c != conn_id);
     }
 
     /// Accept nvim connections forever (each served on its own thread).
@@ -522,4 +615,72 @@ pub fn run(initial_target: Option<&str>, headless_cmds: &[String]) -> Result<i32
         let _ = std::fs::remove_file(t);
     }
     Ok(code)
+}
+
+#[cfg(test)]
+mod eviction_tests {
+    use super::*;
+
+    /// An Agent whose stdin pipe is already dead (child exited).
+    fn dead_agent(host: &str) -> Arc<Agent> {
+        let mut child = std::process::Command::new("true")
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn true");
+        let stdin = child.stdin.take().unwrap();
+        child.wait().unwrap();
+        Arc::new(Agent {
+            host: host.to_string(),
+            stdin: Mutex::new(stdin),
+        })
+    }
+
+    #[test]
+    fn dead_pipe_evicts_agent_and_fails_waiters() {
+        let router = Router::new(std::env::temp_dir().join("rnvim-evict-test"));
+        let agent = dead_agent("deadhost");
+        router
+            .agents
+            .lock()
+            .unwrap()
+            .insert("deadhost".into(), Arc::clone(&agent));
+
+        // a broker-internal waiter already in flight on that host
+        let (tx, rx) = mpsc::channel();
+        router
+            .pending
+            .lock()
+            .unwrap()
+            .insert(INTERNAL_ID_BASE + 7, ("deadhost".into(), tx));
+
+        let err = router
+            .agent_request_timeout(&agent, "fs.stat", json!({}), Duration::from_secs(1))
+            .unwrap_err();
+        assert!(err.to_string().contains("lost"), "err: {err:#}");
+
+        // cache no longer holds the corpse → next ensure_agent redials
+        assert!(!router.agents.lock().unwrap().contains_key("deadhost"));
+
+        // the in-flight waiter was failed immediately, not left to time out
+        let resp = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("waiter got response");
+        assert!(resp.error.is_some());
+    }
+
+    #[test]
+    fn eviction_spares_a_fresh_replacement() {
+        let router = Router::new(std::env::temp_dir().join("rnvim-evict-test2"));
+        let old = dead_agent("host");
+        let fresh = dead_agent("host");
+        router
+            .agents
+            .lock()
+            .unwrap()
+            .insert("host".into(), Arc::clone(&fresh));
+
+        // evicting the OLD agent must not remove the freshly redialed one
+        router.evict_agent(&old);
+        assert!(router.agents.lock().unwrap().contains_key("host"));
+    }
 }
