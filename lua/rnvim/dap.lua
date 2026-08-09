@@ -1,11 +1,16 @@
--- Remote debugging for rust-analyzer runnables: codelldb runs on the
--- workspace host (next to the binary and the real sources), nvim-dap
--- reaches it through an `ssh -L` tunnel, and a local rewriting proxy
--- translates workspace paths at the DAP protocol boundary — breakpoints
--- go out with mirror paths (ws_root .. <remote path>) and come back as
--- remote ones, exactly like lsp_transport does for LSP. lldb-side source
--- mapping (codelldb's sourceMap) is deliberately NOT used: lldb resolves
--- sources on ITS host, where the original remote paths are the right ones.
+-- Generic remote debugging engine: a DAP adapter runs on the workspace
+-- host (next to the binary and the real sources), nvim-dap reaches it
+-- through an `ssh -L` tunnel, and a local rewriting proxy translates
+-- workspace paths at the DAP protocol boundary — breakpoints go out with
+-- mirror paths (ws_root .. <remote path>) and come back as remote ones,
+-- exactly like lsp_transport does for LSP. Adapter-side source mapping
+-- (e.g. codelldb's sourceMap) is deliberately NOT used: the adapter
+-- resolves sources on ITS host, where the original remote paths are the
+-- right ones.
+--
+-- This module knows nothing about languages or build systems; per-language
+-- frontends (rnvim.dap.rust, ...) translate their runnables into a call to
+-- M.debug().
 
 local rpc = require("rnvim.rpc")
 local util = require("rnvim.util")
@@ -14,7 +19,7 @@ local workspace = require("rnvim.workspace")
 local M = {}
 
 local TOOLS_PATH = "$HOME/.rnvim/tools/bin:$HOME/.rnvim/tools/npm/node_modules/.bin"
-local ADAPTER = "rnvim_codelldb"
+local ADAPTER = "rnvim_dap"
 
 -- live tunnel + proxy per dap session, torn down when the session ends
 local tunnels = {}
@@ -31,14 +36,16 @@ local function free_port()
   return port
 end
 
---- codelldb present on the workspace host, installing on first use.
-local function ensure_codelldb(cb)
-  local ok, res = pcall(rpc.request, "exec.which", { name = "codelldb" })
+--- `bin` present on the workspace host, installing on first use (user
+--- recipe first, then the mason-registry planner — same precedence as
+--- language servers).
+local function ensure_tool(bin, cb)
+  local ok, res = pcall(rpc.request, "exec.which", { name = bin })
   if ok and not is_null(res.path) then
     return cb(nil)
   end
-  util.notify("installing codelldb on the workspace host (first use)...")
-  local user_script = require("rnvim.recipes").user_script("codelldb")
+  util.notify(("installing %s on the workspace host (first use)..."):format(bin))
+  local user_script = require("rnvim.recipes").user_script(bin)
   if user_script then
     rpc.request_async("exec.run", { script = user_script }, function(err, rres)
       if err or rres.code ~= 0 then
@@ -49,57 +56,38 @@ local function ensure_codelldb(cb)
     end)
     return
   end
-  require("rnvim.registry").install("codelldb", function(err)
+  require("rnvim.registry").install(bin, function(err)
     cb(err)
   end)
 end
 
---- Build the runnable's binary remotely with cargo; cb(err, remote_exe).
-local function build_runnable(runnable, remote_root, cb)
-  local args = runnable.args
-  local cmd = { "cargo" }
-  vim.list_extend(cmd, args.cargoArgs or {})
-  vim.list_extend(cmd, args.cargoExtraArgs or {})
-  if cmd[2] == "run" then
-    cmd[2] = "build"
-  else
-    cmd[#cmd + 1] = "--no-run"
-  end
-  cmd[#cmd + 1] = "--message-format=json"
-
-  local quoted = {}
-  for _, a in ipairs(cmd) do
-    quoted[#quoted + 1] = util.shell_quote(a)
-  end
-  local script = ("cd %s && %s"):format(util.shell_quote(remote_root), table.concat(quoted, " "))
-
-  util.notify(("building %s on %s..."):format(runnable.label or "runnable", workspace.current().host))
+--- Run a build script on the workspace host; cb(err, stdout).
+local function run_build(script, label, cb)
+  util.notify(("building %s on %s..."):format(label, workspace.current().host))
   rpc.request_async("exec.run", { script = script }, function(err, res)
     if err then
       return cb(err)
     end
     if res.code ~= 0 then
-      return cb((res.stderr or ""):match("error%[?[^\n]*") or ("cargo exited " .. res.code))
+      local stderr = res.stderr or ""
+      return cb(stderr:match("[Ee]rror[^\n]*") or stderr:match("([^\n]+)%s*$") or ("build exited " .. res.code))
     end
-    local exe
-    for line in (res.stdout or ""):gmatch("[^\n]+") do
-      local ok, msg = pcall(vim.json.decode, line)
-      if ok and type(msg) == "table" and not is_null(msg.executable) then
-        exe = msg.executable
-      end
-    end
-    if not exe then
-      return cb("cargo produced no debuggable executable")
-    end
-    cb(nil, exe)
+    cb(nil, res.stdout or "")
   end)
 end
 
---- Start codelldb on `host` behind an ssh -L tunnel; cb(err, port, handle).
-local function start_adapter(host, cb)
+--- Start the adapter on `host` behind an ssh -L tunnel; cb(err, port, handle).
+--- `adapter` = { command = "codelldb", args = fun(port): string[] }.
+local function start_adapter(host, adapter, cb)
   local lport = free_port()
   local rport = free_port() -- free here, almost certainly free there
-  local remote = ('PATH="%s:$PATH" exec codelldb --port %d'):format(TOOLS_PATH, rport)
+  local argv = { adapter.command }
+  vim.list_extend(argv, adapter.args(rport))
+  local quoted = {}
+  for _, a in ipairs(argv) do
+    quoted[#quoted + 1] = util.shell_quote(a)
+  end
+  local remote = ('PATH="%s:$PATH" exec %s'):format(TOOLS_PATH, table.concat(quoted, " "))
   local cmd = {
     "ssh",
     "-o",
@@ -118,14 +106,14 @@ local function start_adapter(host, cb)
     if not done then
       done = true
       vim.schedule(function()
-        cb(("codelldb tunnel exited: %s"):format(vim.trim(out.stderr or "")), nil, nil)
+        cb(("%s tunnel exited: %s"):format(adapter.command, vim.trim(out.stderr or "")), nil, nil)
       end)
     end
   end)
 
   -- Readiness: poll ON THE REMOTE for the adapter port to be listening.
   -- Probing the local end is useless (ssh accepts as soon as it binds,
-  -- remote side up or not) and a probe connection can poison codelldb.
+  -- remote side up or not) and a probe connection can poison the adapter.
   local poll = ([[
 for i in $(seq 1 60); do
   if command -v ss >/dev/null 2>&1; then
@@ -148,8 +136,8 @@ exit 1]]):format(rport, rport)
       handle:kill(15)
       local why = err
         or (res.code == 2 and "neither ss nor netstat on the remote host")
-        or "timed out waiting for codelldb to listen"
-      return cb("codelldb tunnel: " .. why, nil, nil)
+        or ("timed out waiting for %s to listen"):format(adapter.command)
+      return cb(("%s tunnel: %s"):format(adapter.command, why), nil, nil)
     end
     cb(nil, lport, handle)
   end)
@@ -244,9 +232,23 @@ local function ensure_cleanup_listeners(dap)
   dap.listeners.after.disconnect[ADAPTER] = drop
 end
 
---- Debug a rust-analyzer runnable (the debugSingle code-lens payload)
---- inside the instance's remote workspace.
-function M.debug_rust_runnable(runnable)
+--- Debug a program on the workspace host.
+---
+--- opts:
+---   name     session name shown by nvim-dap
+---   adapter  { command = string, args = fun(port: integer): string[] }
+---            a server-mode DAP adapter started on the workspace host;
+---            installed on first use like language servers
+---   build    optional { script = string, label = string?,
+---                       program = (fun(stdout: string): string?)? }
+---            remote build step; `program` extracts the debuggee path from
+---            the build output and fills config.program when it is unset
+---   config   dap launch configuration; program/cwd are REMOTE paths (the
+---            adapter interprets them on its own host), source paths cross
+---            the boundary through the rewriting proxy
+---   root     remote project root used for reverse path mapping (frames
+---            under it map back into the local workspace mirror)
+function M.debug(opts)
   local ok_dap, dap = pcall(require, "dap")
   if not ok_dap then
     util.notify("nvim-dap is not installed", vim.log.levels.WARN)
@@ -257,54 +259,50 @@ function M.debug_rust_runnable(runnable)
     util.notify("no remote workspace attached", vim.log.levels.WARN)
     return
   end
-  local args = runnable and runnable.args
-  if not args or runnable.kind ~= "cargo" then
-    util.notify("unsupported rust-analyzer runnable", vim.log.levels.WARN)
-    return
+
+  local function launch(program)
+    start_adapter(ws.host, opts.adapter, function(terr, tunnel_port, handle)
+      if terr then
+        return util.notify(terr, vim.log.levels.ERROR)
+      end
+      local proxy_port, proxy = start_rewrite_proxy(tunnel_port, ws, opts.root)
+      dap.adapters[ADAPTER] = function(cb)
+        cb({ type = "server", host = "127.0.0.1", port = proxy_port })
+      end
+      ensure_cleanup_listeners(dap)
+      local config = vim.tbl_extend("keep", {
+        name = opts.name or "remote debug",
+        type = ADAPTER,
+        request = "launch",
+        program = program,
+      }, opts.config or {})
+      dap.run(config)
+      local session = dap.session()
+      if session and handle then
+        tunnels[session.id] = { tunnel = handle, proxy = proxy }
+      end
+    end)
   end
 
-  -- the lens payload crossed the LSP rewrite boundary, so workspaceRoot
-  -- arrives as a local ws-prefixed path: translate it back
-  local remote_root = args.workspaceRoot or ws.entry
-  if vim.startswith(remote_root, ws.ws_root) then
-    remote_root = workspace.remote_path(remote_root)
-  end
-
-  ensure_codelldb(function(err)
+  ensure_tool(opts.adapter.command, function(err)
     if err then
-      return util.notify("codelldb install failed: " .. err, vim.log.levels.ERROR)
+      return util.notify(("%s install failed: %s"):format(opts.adapter.command, err), vim.log.levels.ERROR)
     end
-    build_runnable(runnable, remote_root, function(berr, exe)
+    if not opts.build then
+      return launch(nil)
+    end
+    run_build(opts.build.script, opts.build.label or opts.name or "runnable", function(berr, stdout)
       if berr then
         return util.notify("build failed: " .. berr, vim.log.levels.ERROR)
       end
-      start_adapter(ws.host, function(terr, tunnel_port, handle)
-        if terr then
-          return util.notify(terr, vim.log.levels.ERROR)
+      local program
+      if opts.build.program then
+        program = opts.build.program(stdout)
+        if not program then
+          return util.notify("build produced no debuggable executable", vim.log.levels.ERROR)
         end
-        local proxy_port, proxy = start_rewrite_proxy(tunnel_port, ws, remote_root)
-        dap.adapters[ADAPTER] = function(cb)
-          cb({ type = "server", host = "127.0.0.1", port = proxy_port })
-        end
-        ensure_cleanup_listeners(dap)
-        dap.run({
-          name = runnable.label or "rust debug (remote)",
-          type = ADAPTER,
-          request = "launch",
-          program = exe,
-          args = args.executableArgs or {},
-          cwd = remote_root,
-          stopOnEntry = false,
-          -- let codelldb spawn the debuggee itself: its runInTerminal
-          -- path would ask nvim-dap to run the (remote) launcher locally
-          terminal = "console",
-          sourceLanguages = { "rust" },
-        })
-        local session = dap.session()
-        if session and handle then
-          tunnels[session.id] = { tunnel = handle, proxy = proxy }
-        end
-      end)
+      end
+      launch(program)
     end)
   end)
 end
