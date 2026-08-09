@@ -500,7 +500,7 @@ dependencies = [
 
 [[package]]
 name = "rnvim-agent"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "anyhow",
  "base64",
@@ -517,7 +517,7 @@ dependencies = [
 
 [[package]]
 name = "rnvim-proto"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "serde",
  "serde_json",

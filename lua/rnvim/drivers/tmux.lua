@@ -1,27 +1,22 @@
 -- tmux driver: one workspace per tmux window.
 
+local util = require("rnvim.util")
+
 local M = {}
 
---- The exact nvim invocation a new workspace instance boots with. The
---- target reaches the new instance through an environment variable, not
---- string-interpolated Lua, so no quoting of user input is required.
-function M.instance_cmd()
-  return [[nvim --cmd 'lua vim.g.rnvim = { target = vim.env.RNVIM_TARGET }']]
-end
-
-function M.spawn(slug, target)
+function M.spawn(name, target)
   local res = vim
     .system({
       "tmux",
       "new-window",
       "-n",
-      slug,
+      name,
       "-P",
       "-F",
       "#{window_id}",
       "-e",
       "RNVIM_TARGET=" .. target,
-      M.instance_cmd(),
+      ("nvim --cmd %s"):format(util.shell_quote(util.BOOT_CMD)),
     })
     :wait()
   if res.code ~= 0 then

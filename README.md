@@ -46,10 +46,20 @@ Requirements: Neovim 0.11+, ssh with key auth to your hosts. tmux is optional �
 
 ## Sessions and multiplexers
 
-Session *logic* lives in the plugin (`~/.rnvim/sessions.json`, swept by pid liveness); session *lifetime* lives in your multiplexer. Drivers only need two operations — spawn and focus:
+Session *logic* lives in the plugin (`~/.rnvim/sessions.json`, swept by pid liveness); session *lifetime* lives in your multiplexer. Drivers only need two operations — spawn and focus — and are auto-detected from the environment (`vim.g.rnvim_driver` overrides):
 
-- **tmux** (shipped): one workspace per window; detach/reattach is tmux's own.
-- **none** (fallback): everything works except spawning/switching from inside the editor; start each workspace from a shell with `rnvim <target>`.
+| Driver | Spawn | Focus | Sessions survive terminal restart |
+|---|---|---|---|
+| **tmux** | new window | ✓ | ✓ |
+| **screen** | new window (4.0-compatible) | ✓ | ✓ |
+| **zellij** | new tab (generated layout) | ✓ by tab name | ✓ |
+| **herdr** | new tab (socket API) | ✓ | ✓ |
+| **kitty** | new tab (needs `allow_remote_control yes`) | ✓ | ✗ |
+| **ghostty** | new OS window | ✗ (no remote control) | ✗ |
+| **warp** | new tab (`warp://launch` config) | ✗ (no remote control) | ✗ |
+| **none** | — start from a shell: `rnvim <target>` | ✗ | ✗ |
+
+True multiplexers are preferred over plain terminals when nested (tmux inside kitty → tmux). A driver is ~40 lines — contributions welcome.
 
 `:RnvimConnect` from any instance lists open sessions (switch), recent workspaces, and ssh-config hosts (spawn). Picking a bare host runs a directory-selection stage inside the new instance before anything becomes a workspace.
 
@@ -96,5 +106,4 @@ NVIM=/path/to/nvim ./tests/run.sh
 
 - LSP watched-files (remote watcher)
 - git integration (read-only trio: blame, diff, log)
-- more drivers (screen, zellij, herdr) — a driver is ~40 lines, contributions welcome
 - protocol snapshot tests, docker sshd integration tests

@@ -205,8 +205,7 @@ local function open_target(target)
     return
   end
 
-  local slug = util.host_slug(util.parse_target(target).host)
-  local handle, err = drivers.get().spawn(slug, target)
+  local handle, err = drivers.get().spawn(util.window_name(target), target)
   if err then
     vim.notify("[rnvim] " .. err, vim.log.levels.WARN)
   elseif handle ~= nil then

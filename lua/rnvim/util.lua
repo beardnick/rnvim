@@ -81,6 +81,27 @@ function M.rust_target(uname_sm)
   return map[uname_sm]
 end
 
+--- The nvim invocation every driver boots a workspace instance with. The
+--- target travels via the RNVIM_TARGET environment variable, never by
+--- string-interpolating user input into Lua.
+M.BOOT_CMD = "lua vim.g.rnvim = { target = vim.env.RNVIM_TARGET }"
+
+--- argv for a new workspace instance (drivers that take a command list).
+function M.instance_argv(target)
+  return { "env", "RNVIM_TARGET=" .. target, "nvim", "--cmd", M.BOOT_CMD }
+end
+
+--- Human window/tab name for a target: host slug plus the path's basename.
+function M.window_name(target)
+  local t = M.parse_target(target)
+  local name = M.host_slug(t.host)
+  local base = t.path:gsub("/+$", ""):match("([^/]+)$")
+  if base and base ~= "" and base ~= "~" then
+    name = name .. ":" .. base
+  end
+  return name
+end
+
 function M.notify(msg, level)
   vim.schedule(function()
     vim.notify("[rnvim] " .. msg, level or vim.log.levels.INFO)

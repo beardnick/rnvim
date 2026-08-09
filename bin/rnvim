@@ -20,11 +20,22 @@ RNVIM_TARGET="$1"
 export RNVIM_TARGET
 
 boot="lua vim.g.rnvim = { target = vim.env.RNVIM_TARGET }"
+slug=$(printf '%s' "${RNVIM_TARGET%%:*}" | tr ':/' '__')
 
+# Inside a multiplexer/terminal with a one-line spawn API, open a new
+# window; anywhere else (zellij/herdr/ghostty/warp/plain), run in place —
+# a multiplexer that hosts this shell keeps the session alive either way.
 if [ -n "$TMUX" ]; then
-  slug=$(printf '%s' "${RNVIM_TARGET%%:*}" | tr ':/' '__')
   exec tmux new-window -n "$slug" -e "RNVIM_TARGET=$RNVIM_TARGET" \
     "nvim --cmd 'lua vim.g.rnvim = { target = vim.env.RNVIM_TARGET }'"
+fi
+if [ -n "$STY" ]; then
+  exec screen -X screen -t "$slug" env "RNVIM_TARGET=$RNVIM_TARGET" \
+    nvim --cmd "$boot"
+fi
+if [ -n "$KITTY_LISTEN_ON" ]; then
+  exec kitty @ launch --type=tab --tab-title "$slug" \
+    --env "RNVIM_TARGET=$RNVIM_TARGET" nvim --cmd "$boot" >/dev/null
 fi
 
 exec nvim --cmd "$boot"

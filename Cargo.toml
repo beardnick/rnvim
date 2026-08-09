@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/rnvim-proto", "crates/rnvim-agent"]
 
 [workspace.package]
-version = "0.10.1"
+version = "0.10.2"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/beardnick/rnvim"

@@ -172,6 +172,57 @@ check("parses ssh config with includes, skips wildcards", function()
   eq(out, { "dev-box", "staging", "gpu-server" })
 end)
 
+-- ---------------------------------------------------------------- drivers
+check("driver detection order and override", function()
+  local drivers = require("rnvim.drivers")
+  local saved = {}
+  local vars = { "TMUX", "STY", "ZELLIJ", "HERDR_SOCKET_PATH", "KITTY_WINDOW_ID", "TERM_PROGRAM", "GHOSTTY_RESOURCES_DIR" }
+  for _, v in ipairs(vars) do
+    saved[v] = vim.env[v]
+    vim.env[v] = nil
+  end
+
+  eq(drivers._detect(), "none")
+  vim.env.TERM_PROGRAM = "WarpTerminal"
+  eq(drivers._detect(), "warp")
+  vim.env.TERM_PROGRAM = "ghostty"
+  eq(drivers._detect(), "ghostty")
+  vim.env.KITTY_WINDOW_ID = "3"
+  eq(drivers._detect(), "kitty")
+  vim.env.HERDR_SOCKET_PATH = "/tmp/h.sock"
+  eq(drivers._detect(), "herdr")
+  vim.env.ZELLIJ = "0"
+  eq(drivers._detect(), "zellij")
+  vim.env.STY = "123.pts-0.host"
+  eq(drivers._detect(), "screen")
+  vim.env.TMUX = "/tmp/tmux-1/default,1,0"
+  eq(drivers._detect(), "tmux", "multiplexers beat terminals")
+  vim.g.rnvim_driver = "kitty"
+  eq(drivers._detect(), "kitty", "explicit override wins")
+
+  vim.g.rnvim_driver = nil
+  for _, v in ipairs(vars) do
+    vim.env[v] = saved[v]
+  end
+end)
+
+check("every driver module loads and honors the contract", function()
+  for _, name in ipairs({ "tmux", "screen", "zellij", "herdr", "kitty", "ghostty", "warp", "none" }) do
+    local d = require("rnvim.drivers." .. name)
+    assert(type(d.spawn) == "function", name .. ".spawn")
+    assert(type(d.focus) == "function", name .. ".focus")
+    assert(type(d.self_handle) == "function", name .. ".self_handle")
+  end
+end)
+
+check("window names carry host and project", function()
+  local util = require("rnvim.util")
+  eq(util.window_name("dev-box:~/proj/api"), "dev-box:api")
+  eq(util.window_name("dev-box"), "dev-box")
+  eq(util.window_name("user@10.0.0.1:/data/notes/"), "user@10.0.0.1:notes")
+  eq(util.window_name("local:/tmp"), "local:tmp")
+end)
+
 -- ------------------------------------------------------------------- util
 check("parses targets", function()
   local util = require("rnvim.util")
