@@ -229,7 +229,7 @@ case "%s" in
   *.tar.gz|*.tgz) tar xzf "$staged" -C "%s" ;;
   *.tar.xz)       tar xJf "$staged" -C "%s" ;;
   *.tar)          tar xf "$staged" -C "%s" ;;
-  *.zip)
+  *.zip|*.vsix)
     command -v unzip >/dev/null 2>&1 || { echo "unzip required on this host" >&2; exit 1; }
     unzip -oq "$staged" -d "%s" ;;
   *.gz)
