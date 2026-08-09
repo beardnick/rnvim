@@ -33,8 +33,12 @@ jobs:
         run: nvim --headless --clean --cmd "set rtp+=." -l tests/unit_spec.lua
       - name: Build agent
         run: cargo build -p rnvim-agent
-      - name: Loopback e2e
+      - name: E2e scenarios
         run: |
-          E2E_HOME=$(mktemp -d)
-          HOME="$E2E_HOME" RNVIM_AGENT_BIN="$PWD/target/debug/rnvim-agent" \
-            nvim --headless --clean --cmd "set rtp+=." -l tests/e2e.lua
+          for spec in tests/e2e/*_spec.lua; do
+            echo "== $spec"
+            E2E_HOME=$(mktemp -d)
+            HOME="$E2E_HOME" RNVIM_AGENT_BIN="$PWD/target/debug/rnvim-agent" \
+              nvim --headless --clean --cmd "set rtp+=." -l "$spec"
+            rm -rf "$E2E_HOME"
+          done
