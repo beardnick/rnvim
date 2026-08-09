@@ -91,14 +91,27 @@ local function read_buf(bufnr)
     vim.api.nvim_echo({ { ('"%s" %dB (rnvim: %s)'):format(short(remote), res.size, ws.host) } }, false, {})
   end
 
-  local ft = vim.filetype.match({ filename = remote, buf = bufnr })
-  if ft then
-    vim.bo[bufnr].filetype = ft
+  -- BufReadCmd suppresses BufReadPost the same way; firing it lets the
+  -- stock filetype detection and any user read hooks treat this like a
+  -- normal file load.
+  vim.api.nvim_exec_autocmds("BufReadPost", { buffer = bufnr, modeline = false })
+  if vim.bo[bufnr].filetype == "" then
+    local ft = vim.filetype.match({ filename = remote, buf = bufnr })
+    if ft then
+      vim.bo[bufnr].filetype = ft
+    end
   end
 end
 
 local function write_buf(bufnr)
   local ws, remote = buf_remote(bufnr)
+
+  -- BufWriteCmd REPLACES the whole write, so the Pre/Post write events
+  -- never fire on their own. They carry real machinery: LSP didSave
+  -- (rust-analyzer only re-runs cargo check on save), format-on-save
+  -- hooks, code-lens refreshers. Fire them around the virtual write.
+  vim.api.nvim_exec_autocmds("BufWritePre", { buffer = bufnr, modeline = false })
+
   local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
   local text = table.concat(lines, "\n")
   if vim.bo[bufnr].endofline or vim.bo[bufnr].fixendofline then
@@ -112,6 +125,8 @@ local function write_buf(bufnr)
     false,
     {}
   )
+
+  vim.api.nvim_exec_autocmds("BufWritePost", { buffer = bufnr, modeline = false })
 end
 
 function M.setup()
