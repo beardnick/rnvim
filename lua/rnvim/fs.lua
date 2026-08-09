@@ -81,6 +81,11 @@ local function read_buf(bufnr)
     return
   end
 
+  -- Native reads fire BufReadPre before touching the file (large-file
+  -- plugins etc. hook it to prepare the buffer); BufReadCmd swallows it
+  -- like the rest of the Pre/Post family, so fire it before fetching.
+  vim.api.nvim_exec_autocmds("BufReadPre", { buffer = bufnr, modeline = false })
+
   if st.kind == "missing" then
     vim.bo[bufnr].modified = false
     vim.api.nvim_echo({ { ('"%s" [New File] (rnvim: %s)'):format(short(remote), ws.host) } }, false, {})
