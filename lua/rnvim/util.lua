@@ -8,6 +8,12 @@ function M.version()
   return require("rnvim.meta").version
 end
 
+--- Version of the agent this plugin deploys (decoupled from the plugin
+--- version so Lua-only changes never force a release).
+function M.agent_version()
+  return require("rnvim.meta").agent_version
+end
+
 --- ~/.rnvim, created on demand.
 function M.home(...)
   local p = vim.fs.joinpath(vim.uv.os_homedir(), ".rnvim", ...)

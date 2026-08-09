@@ -90,7 +90,7 @@ True multiplexers are preferred over plain terminals when nested (tmux inside ki
 
 Path model: remote absolute paths are mounted under the local prefix `~/.rnvim/ws/<host>/` (prefix mapping, not a URL scheme), so LSP URI rewriting degenerates to pure prefix replacement.
 
-Versioning: the plugin (`lua/rnvim/meta.lua`) and the agent release share one version. Agents are version-stamped on the remote (`~/.rnvim/bin/rnvim-agent-<version>`), deployed from the matching GitHub release — plugin and agent can never skew.
+Versioning: the plugin's `agent_version` (`lua/rnvim/meta.lua`) pins the agent release it deploys. Agents are version-stamped on the remote (`~/.rnvim/bin/rnvim-agent-<agent_version>`), pulled from that exact GitHub release — plugin and agent can never skew, and protocol compatibility is checked again at the hello handshake. The plugin's own `version` moves freely with master; only Rust/protocol changes bump `agent_version` and cut a release.
 
 ## Development
 

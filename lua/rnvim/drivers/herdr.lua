@@ -1,10 +1,12 @@
--- herdr driver: one workspace per herdr tab, driven over herdr's socket
--- API (herdr exports HERDR_SOCKET_PATH / HERDR_TAB_ID to its panes).
+-- herdr driver: one rnvim workspace per herdr WORKSPACE (a "space" in the
+-- sidebar — the project-level unit, matching what a remote workspace is),
+-- driven over herdr's socket API (herdr exports HERDR_SOCKET_PATH /
+-- HERDR_WORKSPACE_ID to its panes).
 --
--- `herdr tab create` starts the tab's default shell (it cannot exec a
--- command directly), so the nvim invocation is injected with
--- pane send-text + send-keys enter; the target still travels via --env,
--- never through shell-quoted interpolation.
+-- `herdr workspace create` starts the root pane's default shell (it
+-- cannot exec a command directly), so the nvim invocation is injected
+-- with pane send-text + send-keys enter; the target still travels via
+-- --env, never through shell-quoted interpolation.
 
 local util = require("rnvim.util")
 
@@ -28,15 +30,15 @@ end
 
 function M.spawn(name, target)
   local created, err =
-    api({ "tab", "create", "--label", name, "--env", "RNVIM_TARGET=" .. target, "--focus" })
+    api({ "workspace", "create", "--label", name, "--env", "RNVIM_TARGET=" .. target, "--focus" })
   if not created then
     return nil, err
   end
   local result = created.result or {}
-  local tab_id = result.tab and result.tab.tab_id
+  local ws_id = result.workspace and result.workspace.workspace_id
   local pane_id = result.root_pane and result.root_pane.pane_id
-  if not tab_id or not pane_id then
-    return nil, "herdr tab create returned no tab/pane id"
+  if not ws_id or not pane_id then
+    return nil, "herdr workspace create returned no workspace/pane id"
   end
 
   local _, terr = api({ "pane", "send-text", pane_id, "exec nvim --cmd '" .. util.BOOT_CMD .. "'" })
@@ -47,14 +49,14 @@ function M.spawn(name, target)
   if kerr then
     return nil, kerr
   end
-  return tab_id
+  return ws_id
 end
 
 function M.focus(handle)
   if not handle or handle == "" then
-    return false, "session has no herdr tab handle"
+    return false, "session has no herdr workspace handle"
   end
-  local msg, err = api({ "tab", "focus", handle })
+  local msg, err = api({ "workspace", "focus", handle })
   if not msg then
     return false, err
   end
@@ -62,7 +64,7 @@ function M.focus(handle)
 end
 
 function M.self_handle()
-  local id = vim.env.HERDR_TAB_ID
+  local id = vim.env.HERDR_WORKSPACE_ID
   return (id and id ~= "") and id or nil
 end
 

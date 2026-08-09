@@ -17,7 +17,7 @@ local M = {}
 local REPO = "beardnick/rnvim"
 
 local function bin_path()
-  return "$HOME/.rnvim/bin/rnvim-agent-" .. util.version()
+  return "$HOME/.rnvim/bin/rnvim-agent-" .. util.agent_version()
 end
 
 local function ssh_run(host, script, stdin_data)
@@ -33,7 +33,7 @@ end
 --- Download the prebuilt agent for `target`, caching it under
 --- ~/.rnvim/dist/<version>/. Returns the local path.
 local function fetch_agent_dist(target)
-  local version = util.version()
+  local version = util.agent_version()
   local dist_dir = util.home("dist", version)
   local asset = "rnvim-agent-" .. target
   local path = vim.fs.joinpath(dist_dir, asset)

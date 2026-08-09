@@ -31,11 +31,11 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - name: Check plugin version matches tag
+      - name: Check agent version matches tag
         run: |
           tag="${GITHUB_REF_NAME#v}"
-          grep -q "version = \"$tag\"" lua/rnvim/meta.lua || {
-            echo "lua/rnvim/meta.lua version does not match tag $GITHUB_REF_NAME" >&2
+          grep -q "agent_version = \"$tag\"" lua/rnvim/meta.lua || {
+            echo "lua/rnvim/meta.lua agent_version does not match tag $GITHUB_REF_NAME" >&2
             exit 1
           }
           grep -q "^version = \"$tag\"" Cargo.toml || {
