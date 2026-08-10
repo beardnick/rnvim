@@ -218,6 +218,16 @@ local function accept()
     return
   end
   if #state.items == 0 then
+    if state.mode == "connect" then
+      -- nothing matched: treat the typed query as a target itself
+      -- (an ad-hoc user@host or host:path needs no ssh-config entry)
+      local q = vim.trim(current_query())
+      close()
+      if q ~= "" then
+        open_target(q)
+      end
+      return
+    end
     close()
     return
   end
@@ -307,7 +317,10 @@ local function project_root(ws)
   return ws.project_root
 end
 
---- Connect candidates: open sessions first, then recents, then ssh hosts.
+--- Connect candidates: open sessions first, then recents, then ssh
+--- hosts. EVERY ssh host is listed bare — even one whose recents appear
+--- above — because the bare entry is how you open a NEW directory on
+--- that host (it runs the directory-selection stage in the new instance).
 local function connect_items()
   local items = {}
   local me = vim.uv.os_getpid()
@@ -317,16 +330,12 @@ local function connect_items()
     end
   end
   local remotes = require("rnvim.remotes")
-  local seen_host = {}
   for _, e in ipairs(remotes.load_recent()) do
     local target = ("%s:%s"):format(e.host, e.path)
     items[#items + 1] = { display = target, target = target }
-    seen_host[e.host] = true
   end
   for _, h in ipairs(remotes.ssh_hosts()) do
-    if not seen_host[h] then
-      items[#items + 1] = { display = h, target = h }
-    end
+    items[#items + 1] = { display = h, target = h }
   end
   return items
 end
@@ -458,6 +467,9 @@ function M.open_browse(host, on_rooted)
   state.browse_on_rooted = on_rooted
   fetch_browse("~")
 end
+
+-- exposed for tests
+M._connect_items = connect_items
 
 --- Re-run the current search (used by async browse fetches).
 function M._research()
