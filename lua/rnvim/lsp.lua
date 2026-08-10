@@ -196,7 +196,63 @@ function M.register_workspace(ws)
   vim.lsp.enable(names)
 end
 
+--- Stop every rnvim-managed client (force — a wedged ssh carrier never
+--- answers a polite shutdown) and re-trigger attachment for workspace
+--- buffers. vim.lsp.enable re-starts servers on FileType, so refiring it
+--- is the whole restart.
+function M.restart()
+  local workspace_mod = require("rnvim.workspace")
+  local stopped = {}
+  for _, client in ipairs(vim.lsp.get_clients()) do
+    if client.name:find("_rnvim$") then
+      stopped[#stopped + 1] = client.name
+      client:stop(true)
+    end
+  end
+
+  local function reattach()
+    for _, buf in ipairs(vim.api.nvim_list_bufs()) do
+      if vim.api.nvim_buf_is_loaded(buf) and workspace_mod.of_file(vim.api.nvim_buf_get_name(buf)) then
+        vim.api.nvim_exec_autocmds("FileType", { buffer = buf })
+      end
+    end
+  end
+
+  -- Refiring FileType while an old client is still winding down makes
+  -- vim.lsp.enable reuse the dying client instead of starting a fresh
+  -- one. Stopped clients can linger in the registry, so wait for
+  -- is_stopped() — not for removal — before re-attaching (bounded: a
+  -- wedged process can take a moment to acknowledge even a force stop).
+  local function wait_stopped(tries)
+    for _, client in ipairs(vim.lsp.get_clients()) do
+      if client.name:find("_rnvim$") and not client:is_stopped() then
+        if tries > 0 then
+          vim.defer_fn(function()
+            wait_stopped(tries - 1)
+          end, 200)
+        else
+          vim.notify("[rnvim] old LSP clients did not stop; re-attaching anyway", vim.log.levels.WARN)
+          reattach()
+        end
+        return
+      end
+    end
+    reattach()
+  end
+  wait_stopped(25)
+
+  if #stopped > 0 then
+    vim.notify("[rnvim] restarting LSP: " .. table.concat(stopped, ", "))
+  else
+    vim.notify("[rnvim] no rnvim LSP clients were running; re-attaching", vim.log.levels.WARN)
+  end
+end
+
 function M.setup()
+  vim.api.nvim_create_user_command("RnvimLspRestart", M.restart, {
+    desc = "rnvim: restart the workspace language servers",
+  })
+
   -- Definition-jump keymaps nvim does not ship by default (gd is the old
   -- "local declaration" motion). grr/gri/grn/gra/K/CTRL-] are built-ins.
   vim.api.nvim_create_autocmd("LspAttach", {
