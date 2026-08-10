@@ -28,10 +28,18 @@ local function server_invocation(host, server_cmd)
     quoted[#quoted + 1] = util.shell_quote(a)
   end
   local script = ('PATH="%s:$PATH" exec %s'):format(TOOLS_PATH, table.concat(quoted, " "))
+  -- Keepalives, for the same reason the agent transport has them: a NAT
+  -- or firewall silently dropping the idle connection otherwise leaves a
+  -- half-dead server; with them ssh exits within ~90s and the client
+  -- reports the death instead of hanging (restart via :RnvimLspRestart).
   return {
     "ssh",
     "-o",
     "BatchMode=yes",
+    "-o",
+    "ServerAliveInterval=30",
+    "-o",
+    "ServerAliveCountMax=3",
     host,
     ('exec "${SHELL:-/bin/sh}" -lc %s'):format(util.shell_quote(script)),
   },
